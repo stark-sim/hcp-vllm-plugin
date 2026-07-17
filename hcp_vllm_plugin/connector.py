@@ -134,7 +134,9 @@ class HcpCpConnector(KVConnectorBase_V1):
 
         external = _align_down(self._prefix_len, self._block_size)
         external = max(external - num_computed_tokens, 0)
-        return external, external > 0
+        # Synchronous load: prefix KV is already in the shared store, so the
+        # scheduler can compute the suffix this step (load_kv_async=False).
+        return external, False
 
     def _prefix_ready(self) -> bool:
         for chunk_key in self._prefix_chunk_ids:
