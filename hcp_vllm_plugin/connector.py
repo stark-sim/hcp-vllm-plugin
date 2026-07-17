@@ -131,15 +131,19 @@ class HcpCpConnector(KVConnectorBase_V1):
     def _fetch(self, rel_path: str, dest_path: str) -> bool:
         """Download rel_path from the peer store to dest_path. Returns success."""
         url = f"{self._peer_url}/{rel_path}"
-        try:
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            with urllib.request.urlopen(url, timeout=self._load_timeout_s) as resp, \
-                    open(dest_path, "wb") as f:
-                f.write(resp.read())
-            return True
-        except Exception as e:
-            logger.warning("fetch %s failed: %s", url, e)
-            return False
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        last_err = None
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(url, timeout=self._load_timeout_s) as resp, \
+                        open(dest_path, "wb") as f:
+                    f.write(resp.read())
+                return True
+            except Exception as e:
+                last_err = e
+                time.sleep(0.2 * (attempt + 1))
+        logger.warning("fetch %s failed after retries: %s", url, last_err)
+        return False
 
     def _remote_exists(self, rel_path: str) -> bool:
         url = f"{self._peer_url}/{rel_path}"
