@@ -104,7 +104,10 @@ class HcpCpConnector(KVConnectorBase_V1):
 
         self._requests_need_load: dict[str, Request] = {}
         os.makedirs(self._run_dir(), exist_ok=True)
-        if self._cp_role == "producer" and self._serve_port > 0:
+        # Only the worker-side connector actually holds/serves the KV; the
+        # scheduler-side instance must not bind the HTTP port.
+        if (self._cp_role == "producer" and self._serve_port > 0
+                and self._role == KVConnectorRole.WORKER):
             self._start_http_server()
         logger.info(
             "HcpCpConnector init: role=%s chunk=%s prefix=%s(%d) path=%s peer=%s serve=%d",
