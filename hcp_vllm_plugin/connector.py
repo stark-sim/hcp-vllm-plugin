@@ -246,7 +246,9 @@ class HcpCpConnector(KVConnectorBase_V1):
                         f.write(str(time.time()))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
-        return finished_req_ids, None
+        # Shared-path load/save is synchronous within the step; there are no
+        # background sends/recvs to report, so return no finished ids.
+        return None, None
 
     # ------------------------------------------------------------------
     # Misc
