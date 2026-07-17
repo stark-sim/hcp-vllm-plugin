@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import os
 import time
+import threading
+import urllib.request
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -94,14 +96,56 @@ class HcpCpConnector(KVConnectorBase_V1):
         self._prefix_chunk_ids = [s for s in prefix_ids.split(",") if s]
         self._prefix_len = int(cfg.get_from_extra_config("cp_prefix_len", 0))
         self._load_timeout_s = float(cfg.get_from_extra_config("cp_load_timeout_s", 600))
+        # Network transport: consumer pulls prefix KV from the producer's HTTP
+        # server (cp_peer_url, e.g. "http://100.118.253.68:8899"); producer
+        # serves its store on cp_serve_port.  Empty peer_url => local shared path.
+        self._peer_url = cfg.get_from_extra_config("cp_peer_url", "").rstrip("/")
+        self._serve_port = int(cfg.get_from_extra_config("cp_serve_port", 0))
 
         self._requests_need_load: dict[str, Request] = {}
         os.makedirs(self._run_dir(), exist_ok=True)
+        if self._cp_role == "producer" and self._serve_port > 0:
+            self._start_http_server()
         logger.info(
-            "HcpCpConnector init: role=%s chunk=%s prefix=%s(%d) path=%s",
+            "HcpCpConnector init: role=%s chunk=%s prefix=%s(%d) path=%s peer=%s serve=%d",
             self._cp_role, self._chunk_id, self._prefix_chunk_ids,
-            self._prefix_len, self._run_dir(),
+            self._prefix_len, self._run_dir(), self._peer_url, self._serve_port,
         )
+
+    def _start_http_server(self) -> None:
+        """Serve the shared store over HTTP so remote consumers can pull KV."""
+        from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+        from functools import partial
+
+        handler = partial(SimpleHTTPRequestHandler, directory=self._shared_path)
+        server = ThreadingHTTPServer(("0.0.0.0", self._serve_port), handler)
+        server.daemon_threads = True
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        self._http_server = server
+        logger.info("HcpCpConnector serving KV store on 0.0.0.0:%d", self._serve_port)
+
+    def _fetch(self, rel_path: str, dest_path: str) -> bool:
+        """Download rel_path from the peer store to dest_path. Returns success."""
+        url = f"{self._peer_url}/{rel_path}"
+        try:
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            with urllib.request.urlopen(url, timeout=self._load_timeout_s) as resp, \
+                    open(dest_path, "wb") as f:
+                f.write(resp.read())
+            return True
+        except Exception as e:
+            logger.warning("fetch %s failed: %s", url, e)
+            return False
+
+    def _remote_exists(self, rel_path: str) -> bool:
+        url = f"{self._peer_url}/{rel_path}"
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=10):
+                return True
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Paths
@@ -140,7 +184,11 @@ class HcpCpConnector(KVConnectorBase_V1):
 
     def _prefix_ready(self) -> bool:
         for chunk_key in self._prefix_chunk_ids:
-            if not os.path.exists(self._ready_marker(chunk_key)):
+            if self._peer_url:
+                rel = os.path.join(self._run_id, chunk_key, "_READY")
+                if not self._remote_exists(rel):
+                    return False
+            elif not os.path.exists(self._ready_marker(chunk_key)):
                 return False
         return True
 
@@ -203,7 +251,13 @@ class HcpCpConnector(KVConnectorBase_V1):
                 if kv_cache_layer is None:
                     continue
                 fname = self._layer_file(request.chunk_key, layer_name)
-                if not os.path.exists(fname):
+                if self._peer_url:
+                    rel = os.path.join(self._run_id, request.chunk_key,
+                                       f"{layer_name}.safetensors")
+                    if not self._fetch(rel, fname):
+                        logger.warning("prefix KV fetch failed: %s", rel)
+                        continue
+                elif not os.path.exists(fname):
                     logger.warning("prefix KV missing: %s", fname)
                     continue
                 kv = safetensors.torch.load_file(
