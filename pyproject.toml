@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hcp-vllm-plugin"
+version = "0.1.0"
+description = "HCP (Heterogeneous Context Parallelism) block-KV ring connector plugin for vLLM"
+requires-python = ">=3.10"
+dependencies = [
+    "safetensors",
+]
+
+[project.entry-points."vllm.general_plugins"]
+hcp_cp_connector = "hcp_vllm_plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["hcp_vllm_plugin*"]
