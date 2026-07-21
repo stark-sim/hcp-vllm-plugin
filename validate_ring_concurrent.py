@@ -204,6 +204,13 @@ def mode_consumer(args) -> None:
     cons_tokens = [list(o.outputs[0].token_ids) for o in outs]
     print(f"[consumer] tokens: {cons_tokens}", flush=True)
 
+    # Cleanup is one step late BY DESIGN: finished_req_ids are shipped in the
+    # NEXT SchedulerOutput (scheduler.py ships the accumulated set and clears
+    # it).  In continuous serving the next step arrives with the next request;
+    # here we submit one tiny non-CP request to trigger that schedule.
+    cons.generate([TokensPrompt(prompt_token_ids=full[0][:32])],
+                  sampling(None, 1))
+
     # ---- correctness ----
     token_match = cons_tokens == ref_tokens
 

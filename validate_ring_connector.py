@@ -203,6 +203,15 @@ def mode_consumer(args) -> None:
     cons_logits, cons_tokens = run_capture(cons, ids, args.decode)
     print(f"[consumer] tokens: {cons_tokens}", flush=True)
 
+    # Cleanup is one step late BY DESIGN: finished_req_ids are shipped in the
+    # NEXT SchedulerOutput.  Submit one tiny non-CP request to trigger that
+    # schedule so the staged chunk is freed before we check below.
+    from vllm.inputs import TokensPrompt as _TP
+    from vllm import SamplingParams as _SP
+
+    cons.generate([_TP(prompt_token_ids=ids[:32])],
+                  _SP(temperature=0.0, max_tokens=1))
+
     # ---- correctness ----
     token_match = cons_tokens == ref_tokens
     max_diff = (ref_logits - cons_logits).abs().max().item()

@@ -500,4 +500,12 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         return None
 
     def shutdown(self) -> None:
-        return
+        # Engine teardown: drop any staged KV still referenced.  (During
+        # continuous serving, cleanup happens one step after a request
+        # finishes via get_finished; anything left at shutdown is the tail.)
+        for _, (_, first_block_id) in list(self._live.items()):
+            unmap_request_peer(first_block_id)
+        for chunk_key in list(self._chunk_refs):
+            drop_chunk_kv(chunk_key)
+        self._live.clear()
+        self._chunk_refs.clear()
