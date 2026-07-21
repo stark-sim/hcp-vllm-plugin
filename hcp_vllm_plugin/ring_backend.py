@@ -473,12 +473,21 @@ class HcpRingAttentionImpl(AttentionImpl):
 
             # Determine the peer (chunk-A) KV for THIS request.  Lookup is
             # per-row: the request's first block id identifies its staged
-            # peer chunk (registered by the KV connector).
+            # peer chunk (registered by the KV connector).  PoC convenience:
+            # with no mapping and exactly ONE staged chunk (single-request,
+            # no-connector runs such as validate_ring_backend customst),
+            # use that chunk.
             staged = None
             if _ring_enabled():
                 ck = PEER_REQ_MAP.get(int(block_table[r, 0]))
                 if ck is not None:
                     staged = PEER_KV_STAGING.get((ck, layer.layer_name))
+                else:
+                    chunks = {key[0] for key in PEER_KV_STAGING}
+                    if len(chunks) == 1:
+                        staged = PEER_KV_STAGING.get(
+                            (next(iter(chunks)), layer.layer_name)
+                        )
             if staged is not None:
                 k_peer, v_peer = staged
                 peer_end = min(k_peer.shape[0], tk)

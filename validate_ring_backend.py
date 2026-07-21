@@ -109,6 +109,7 @@ def run_one(mode: str, total: int, split: int, out_prefix: str) -> None:
                 k, v = args[1], args[2]
                 t = k.shape[0]
                 rb.stage_peer_kv(
+                    "chunkA",
                     mod.layer_name,
                     k.view(t, mod.num_kv_heads, mod.head_size).detach().clone(),
                     v.view(t, mod.num_kv_heads, mod.head_size).detach().clone(),
