@@ -37,13 +37,17 @@ Configuration (env vars):
                           causal attention, i.e. vanilla behavior).
   HCP_RING_ENABLED      : "1" (default) / "0" master switch.
 
-Peer KV staging API (for the future KV connector):
-  stage_peer_kv(layer_name, k, v) / clear_peer_kv()
+Peer KV staging API (used by HcpRingKvConnector):
+  stage_peer_kv(chunk_key, layer_name, k, v) / drop_chunk_kv / clear_peer_kv
+  map_request_peer(first_block_id, chunk_key) / unmap_request_peer
   k/v: [num_tokens, num_kv_heads, head_dim] contiguous, post-RoPE K.
-  When a layer has staged peer KV it is used as the peer (chunk-A) KV and the
-  first `k.shape[0]` positions of the local cache are excluded from the
-  local path.  Without staged KV, HCP_RING_SPLIT_TOKENS splits the local
-  paged cache instead (single-process validation path).
+  Staging is keyed by (chunk_key, layer_name); each request is bound to its
+  chunk via PEER_REQ_MAP[first_block_id], so multiple requests with different
+  peer chunks can batch concurrently.  When a request's row has staged peer
+  KV it is used as the peer (chunk-A) KV and the first `k.shape[0]` positions
+  of the local cache are excluded from the local path.  Without staged KV,
+  HCP_RING_SPLIT_TOKENS splits the local paged cache instead (single-process
+  validation path).
 """
 
 import os
@@ -60,22 +64,81 @@ from vllm.v1.attention.backends.flash_attn import (
 logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Peer KV staging (module level).  The KV connector will write here; the
+# Peer KV staging (module level).  The KV connector writes here; the
 # AttentionImpl reads (never stores) it during forward.
+#
+# Multi-request design:
+#   PEER_KV_STAGING is keyed by (chunk_key, layer_name) so that several
+#   requests — each with its own peer chunk — can be in flight concurrently.
+#   PEER_REQ_MAP maps a request's FIRST block-table block id (stable for the
+#   request's whole lifetime) to its peer chunk key.  The connector registers
+#   the mapping when it stages the chunk and unregisters it when the request
+#   finishes, so block-id reuse by the allocator is safe.
 # ---------------------------------------------------------------------------
-PEER_KV_STAGING: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+PEER_KV_STAGING: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
+PEER_REQ_MAP: dict[int, str] = {}
 
 
-def stage_peer_kv(layer_name: str, k: torch.Tensor, v: torch.Tensor) -> None:
+def stage_peer_kv(
+    chunk_key: str, layer_name: str, k: torch.Tensor, v: torch.Tensor
+) -> None:
     """Stage a peer chunk's K/V for one attention layer.
 
     k, v: [num_tokens, num_kv_heads, head_dim] — K must be post-RoPE.
     """
-    PEER_KV_STAGING[layer_name] = (k, v)
+    PEER_KV_STAGING[(chunk_key, layer_name)] = (k, v)
+    _note_staging_locked(chunk_key, k)
+
+
+def drop_chunk_kv(chunk_key: str) -> int:
+    """Drop all staged layers of one chunk.  Returns layers dropped."""
+    keys = [key for key in PEER_KV_STAGING if key[0] == chunk_key]
+    for key in keys:
+        del PEER_KV_STAGING[key]
+    return len(keys)
+
+
+def map_request_peer(first_block_id: int, chunk_key: str) -> None:
+    PEER_REQ_MAP[first_block_id] = chunk_key
+
+
+def unmap_request_peer(first_block_id: int) -> None:
+    PEER_REQ_MAP.pop(first_block_id, None)
+
+
+def request_peer_chunk(first_block_id: int) -> str | None:
+    return PEER_REQ_MAP.get(first_block_id)
 
 
 def clear_peer_kv() -> None:
     PEER_KV_STAGING.clear()
+    PEER_REQ_MAP.clear()
+
+
+# High-water marks for validation: staging is freed when a request finishes,
+# so post-run checks cannot inspect live staging — use these counters instead.
+STAGING_STATS: dict = {
+    "max_concurrent_chunks": 0,
+    "max_staged_layers": 0,
+    "last_chunk_len": 0,
+}
+
+
+def reset_staging_stats() -> None:
+    STAGING_STATS["max_concurrent_chunks"] = 0
+    STAGING_STATS["max_staged_layers"] = 0
+    STAGING_STATS["last_chunk_len"] = 0
+
+
+def _note_staging_locked(chunk_key: str, k: torch.Tensor) -> None:
+    STAGING_STATS["max_staged_layers"] = max(
+        STAGING_STATS["max_staged_layers"], len(PEER_KV_STAGING)
+    )
+    chunks = {key[0] for key in PEER_KV_STAGING}
+    STAGING_STATS["max_concurrent_chunks"] = max(
+        STAGING_STATS["max_concurrent_chunks"], len(chunks)
+    )
+    STAGING_STATS["last_chunk_len"] = k.shape[0]
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +366,6 @@ class HcpRingAttentionImpl(AttentionImpl):
         BATCH_STATS["max_reqs"] = max(BATCH_STATS["max_reqs"], len(seq_lens))
 
         split = _split_tokens() if _ring_enabled() else 0
-        staged = (
-            PEER_KV_STAGING.get(layer.layer_name) if _ring_enabled() else None
-        )
 
         for r in range(len(seq_lens)):
             qs, qe = qsl[r], qsl[r + 1]
@@ -325,7 +385,14 @@ class HcpRingAttentionImpl(AttentionImpl):
             q_r = query[qs:qe]
             qpos0 = tk - tq  # global position of this request's first query
 
-            # Determine the peer (chunk-A) KV for this request.
+            # Determine the peer (chunk-A) KV for THIS request.  Lookup is
+            # per-row: the request's first block id identifies its staged
+            # peer chunk (registered by the KV connector).
+            staged = None
+            if _ring_enabled():
+                ck = PEER_REQ_MAP.get(int(block_table[r, 0]))
+                if ck is not None:
+                    staged = PEER_KV_STAGING.get((ck, layer.layer_name))
             if staged is not None:
                 k_peer, v_peer = staged
                 peer_end = min(k_peer.shape[0], tk)

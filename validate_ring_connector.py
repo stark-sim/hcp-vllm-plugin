@@ -199,6 +199,7 @@ def mode_consumer(args) -> None:
     import hcp_vllm_plugin.ring_backend as rb
 
     rb.reset_write_tracking()
+    rb.reset_staging_stats()
     cons_logits, cons_tokens = run_capture(cons, ids, args.decode)
     print(f"[consumer] tokens: {cons_tokens}", flush=True)
 
@@ -208,19 +209,26 @@ def mode_consumer(args) -> None:
     argmax_diff = (ref_logits - cons_logits).abs()[ref_logits.argmax()].item()
 
     # ---- memory-splitting evidence ----
-    n_staged = len(rb.PEER_KV_STAGING)
-    staged_len = (
-        next(iter(rb.PEER_KV_STAGING.values()))[0].shape[0] if n_staged else 0
-    )
+    # Staging is freed when the request finishes, so use the backend's
+    # high-water marks; live staging must be empty now (cleanup proof).
+    n_staged = rb.STAGING_STATS["max_staged_layers"]
+    staged_len = rb.STAGING_STATS["last_chunk_len"]
+    leftover = len(rb.PEER_KV_STAGING)
+    leftover_map = len(rb.PEER_REQ_MAP)
     overlap = rb.WRITE_TRACK["overlap"]
     n_written = len(rb.WRITE_TRACK["slots"])
     mem_ok = (
-        n_staged == NUM_LAYERS and staged_len == args.split and overlap == 0
+        n_staged == NUM_LAYERS
+        and staged_len == args.split
+        and overlap == 0
+        and leftover == 0
+        and leftover_map == 0
     )
     print(f"[memsplit] peer KV staged for {n_staged}/{NUM_LAYERS} layers, "
           f"{staged_len} tokens/layer (fetched over HTTP from producer)")
     print(f"[memsplit] consumer wrote {n_written} pool slots (its own chunk "
           f"only); chunk-A pool slots written locally: {overlap}")
+    print(f"[memsplit] post-run transient staging freed: {leftover == 0 and leftover_map == 0}")
 
     ok = (
         token_match
