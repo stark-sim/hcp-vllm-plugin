@@ -93,6 +93,15 @@ def reset_write_tracking() -> None:
     WRITE_TRACK["overlap"] = 0
 
 
+# Continuous-batching evidence (validation only): largest number of requests
+# seen in one attention step.  Updated unconditionally; cost is negligible.
+BATCH_STATS: dict = {"max_reqs": 0}
+
+
+def reset_batch_stats() -> None:
+    BATCH_STATS["max_reqs"] = 0
+
+
 def _ring_enabled() -> bool:
     return os.environ.get("HCP_RING_ENABLED", "1") == "1"
 
@@ -291,6 +300,7 @@ class HcpRingAttentionImpl(AttentionImpl):
         qsl = attn_metadata.query_start_loc.tolist()
         seq_lens = attn_metadata.seq_lens.tolist()
         block_table = attn_metadata.block_table
+        BATCH_STATS["max_reqs"] = max(BATCH_STATS["max_reqs"], len(seq_lens))
 
         split = _split_tokens() if _ring_enabled() else 0
         staged = (
