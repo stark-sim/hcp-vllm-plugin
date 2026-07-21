@@ -127,7 +127,7 @@ def _ring_fwd_kernel(
 
         v = tl.load(
             v_ptrs + start_n * stride_vs,
-            mask=(pos_k < K_LEN) & (mask_d[None, :]),
+            mask=((start_n + offs_n[:, None]) < K_LEN) & (mask_d[None, :]),
             other=0.0,
         )
         p = p.to(v.dtype)
