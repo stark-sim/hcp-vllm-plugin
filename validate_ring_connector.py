@@ -204,6 +204,7 @@ def mode_consumer(args) -> None:
 
     rb.reset_write_tracking()
     rb.reset_staging_stats()
+    rb.reset_impl_stats()
     cons_logits, cons_tokens = run_capture(cons, ids, args.decode)
     print(f"[consumer] tokens: {cons_tokens}", flush=True)
 
@@ -239,6 +240,12 @@ def mode_consumer(args) -> None:
         and leftover == 0
         and leftover_map == 0
     )
+    impl_ok = (
+        rb.IMPL_STATS["attn_triton"] > 0 and rb.IMPL_STATS["attn_torch"] == 0
+    )
+    print(f"[impl] attn triton/torch calls: {rb.IMPL_STATS['attn_triton']}/"
+          f"{rb.IMPL_STATS['attn_torch']}, merge triton/torch: "
+          f"{rb.IMPL_STATS['merge_triton']}/{rb.IMPL_STATS['merge_torch']}")
     print(f"[memsplit] peer KV staged for {n_staged}/{NUM_LAYERS} layers, "
           f"{staged_len} tokens/layer (fetched over HTTP from producer)")
     print(f"[memsplit] consumer wrote {n_written} pool slots (its own chunk "
@@ -249,6 +256,7 @@ def mode_consumer(args) -> None:
         token_match
         and max_diff < 0.1
         and mem_ok
+        and impl_ok
     )
     print("--- result ---")
     print(f"  tokens match        : {token_match} (ref={ref_tokens} "
@@ -256,6 +264,7 @@ def mode_consumer(args) -> None:
     print(f"  max|logit diff|     : {max_diff:.6f} (at ref argmax: "
           f"{argmax_diff:.6f})")
     print(f"  memory-splitting    : {'OK' if mem_ok else 'VIOLATED'}")
+    print(f"  triton kernel path  : {'OK' if impl_ok else 'NOT USED'}")
     print(f"  verdict: {'PASS' if ok else 'FAIL'}", flush=True)
     sys.exit(0 if ok else 1)
 

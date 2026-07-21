@@ -196,6 +196,7 @@ def mode_consumer(args) -> None:
     rb.reset_write_tracking()
     rb.reset_staging_stats()
     rb.reset_batch_stats()
+    rb.reset_impl_stats()
     outs = cons.generate(
         [TokensPrompt(prompt_token_ids=p) for p in full],
         [sampling(ring_params(CHUNK_KEYS[i], args.split, args.peer_url),
@@ -232,6 +233,12 @@ def mode_consumer(args) -> None:
         and leftover_map == 0
         and max_reqs >= N_REQ
     )
+    impl_ok = (
+        rb.IMPL_STATS["attn_triton"] > 0 and rb.IMPL_STATS["attn_torch"] == 0
+    )
+    print(f"[impl] attn triton/torch calls: {rb.IMPL_STATS['attn_triton']}/"
+          f"{rb.IMPL_STATS['attn_torch']}, merge triton/torch: "
+          f"{rb.IMPL_STATS['merge_triton']}/{rb.IMPL_STATS['merge_torch']}")
     print(f"[memsplit] concurrent chunks staged: {max_chunks}/{N_REQ}, "
           f"{max_layers} layer entries (2x{NUM_LAYERS}), {staged_len} tokens/layer")
     print(f"[memsplit] pool overlap (chunk-A slots written locally): {overlap}")
@@ -239,11 +246,12 @@ def mode_consumer(args) -> None:
     print(f"[lifecycle] staging freed after finish: "
           f"{leftover == 0 and leftover_map == 0}")
 
-    ok = token_match and mem_ok
+    ok = token_match and mem_ok and impl_ok
     print("--- result ---")
     print(f"  tokens match        : {token_match} (ref={ref_tokens} "
           f"cons={cons_tokens})")
     print(f"  multi-req CP + batch: {'OK' if mem_ok else 'VIOLATED'}")
+    print(f"  triton kernel path  : {'OK' if impl_ok else 'NOT USED'}")
     print(f"  verdict: {'PASS' if ok else 'FAIL'}", flush=True)
     sys.exit(0 if ok else 1)
 

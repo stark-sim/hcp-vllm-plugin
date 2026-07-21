@@ -22,20 +22,30 @@ attention math deliberately never reads chunk-A KV on the local path).
 ROCm notes (validated on pearl, gfx1200, torch 2.13+rocm7.13, vllm 0.23.1):
   * upstream `flash_attn` is NOT installed and
     `vllm.v1.attention.backends.fa_utils.is_flash_attn_varlen_func_available()`
-    returns False, so FlashAttentionImpl cannot run here at all.  This file
-    therefore implements attention in plain PyTorch (fp32 accumulation) and
-    computes the logsumexp (LSE, natural log) explicitly.
-  * vLLM's triton `merge_attn_states` matched a PyTorch reference in a toy
-    probe here (4.8e-7), but the HCP team has seen it return `inf` in other
-    ROCm runs — so the merge is implemented in plain PyTorch instead.
-  * The online-softmax merge math itself was verified on this GPU:
-    merged two-chunk attention vs full attention, max|diff| = 3.0e-7 (fp32).
+    returns False (vendored FA is CUDA/XPU-only; ROCm RDNA's native path is
+    Triton), so FlashAttentionImpl cannot run here.  Attention therefore runs
+    through the plugin's own Triton kernel (ring_triton_attn, flash-style
+    with LSE output, validated on gfx1200: max|diff| ~1e-3 fp16 vs the fp32
+    PyTorch reference, LSE ~1e-6); the fp32 plain-PyTorch path remains as a
+    debug fallback (HCP_RING_IMPL=torch).
+  * vLLM's triton `merge_attn_states` is the default LSE merge (validated on
+    gfx1200 vs plain merge: 6.1e-5); plain PyTorch merge remains as fallback
+    (HCP_RING_MERGE=torch).
 
 Configuration (env vars):
   HCP_RING_SPLIT_TOKENS : int, position boundary between chunk A and chunk B.
                           0 (default) disables the ring merge (plain local
                           causal attention, i.e. vanilla behavior).
   HCP_RING_ENABLED      : "1" (default) / "0" master switch.
+  HCP_RING_IMPL         : "triton" (default) / "torch" — attention impl for
+                          the local/peer passes.  "triton" uses
+                          ring_triton_attn (flash-style, no score-matrix
+                          materialization, works on CUDA and ROCm); "torch"
+                          is the original fp32 einsum path (debug fallback).
+  HCP_RING_MERGE        : "triton" (default) / "torch" — LSE merge impl
+                          (vLLM merge_attn_states vs plain PyTorch).
+  IMPL_STATS            : dispatch counters (validation evidence of which
+                          path actually ran).
 
 Peer KV staging API (used by HcpRingKvConnector):
   stage_peer_kv(chunk_key, layer_name, k, v) / drop_chunk_kv / clear_peer_kv
@@ -171,6 +181,82 @@ def _ring_enabled() -> bool:
 
 def _split_tokens() -> int:
     return int(os.environ.get("HCP_RING_SPLIT_TOKENS", "0"))
+
+
+def _ring_impl() -> str:
+    return os.environ.get("HCP_RING_IMPL", "triton")
+
+
+def _merge_impl() -> str:
+    return os.environ.get("HCP_RING_MERGE", "triton")
+
+
+# Implementation dispatch counters (validation evidence: which path ran).
+IMPL_STATS: dict = {
+    "attn_triton": 0,
+    "attn_torch": 0,
+    "merge_triton": 0,
+    "merge_torch": 0,
+}
+
+
+def reset_impl_stats() -> None:
+    for key in IMPL_STATS:
+        IMPL_STATS[key] = 0
+
+
+def _attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    q_pos0_in_kv: int | None,
+    window: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attention + LSE, dispatched to the Triton ring kernel by default.
+
+    Falls back to the plain-PyTorch path (fp32) when the Triton impl is
+    disabled, unavailable, or errors, or when a sliding window is requested
+    (the ring kernel does not implement windowing).
+    """
+    if _ring_impl() == "triton" and window is None and q.is_cuda:
+        try:
+            from hcp_vllm_plugin.ring_triton_attn import ring_attn_with_lse
+
+            o, lse = ring_attn_with_lse(
+                q.contiguous(), k.contiguous(), v.contiguous(), scale,
+                q_pos0_in_kv,
+            )
+            IMPL_STATS["attn_triton"] += 1
+            return o, lse
+        except Exception as e:
+            logger.warning("ring triton attn failed (%s); using torch path", e)
+    IMPL_STATS["attn_torch"] += 1
+    return _attn_with_lse(q, k, v, scale, q_pos0_in_kv, window)
+
+
+def _merge(
+    o_loc: torch.Tensor,
+    lse_loc: torch.Tensor,
+    o_peer: torch.Tensor,
+    lse_peer: torch.Tensor,
+) -> torch.Tensor:
+    """Online-softmax merge of local + peer partial attention, dispatched to
+    vLLM's merge_attn_states (triton) by default; torch LSE merge fallback."""
+    if _merge_impl() == "triton" and o_loc.is_cuda:
+        try:
+            from vllm.v1.attention.ops.merge_attn_states import (
+                merge_attn_states,
+            )
+
+            out = torch.empty_like(o_loc)
+            merge_attn_states(out, o_peer, lse_peer, o_loc, lse_loc)
+            IMPL_STATS["merge_triton"] += 1
+            return out
+        except Exception as e:
+            logger.warning("triton merge failed (%s); using torch merge", e)
+    IMPL_STATS["merge_torch"] += 1
+    return _lse_merge(o_loc, lse_loc, o_peer, lse_peer)
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +491,7 @@ class HcpRingAttentionImpl(AttentionImpl):
 
             if peer_end == 0:
                 # Vanilla path: plain causal attention over all local KV.
-                o, _ = _attn_with_lse(
+                o, _ = _attn(
                     q_r, k_all, v_all, self.scale, qpos0, self.sliding_window
                 )
                 output[qs:qe] = o.to(output.dtype)
@@ -433,14 +519,14 @@ class HcpRingAttentionImpl(AttentionImpl):
                     )
             n_a = max(0, min(tq, peer_end - qpos0))
             if n_a > 0:
-                o_a, _ = _attn_with_lse(
+                o_a, _ = _attn(
                     q_r[:n_a], k_all, v_all, self.scale, qpos0,
                     self.sliding_window,
                 )
                 output[qs : qs + n_a] = o_a.to(output.dtype)
             if n_a < tq:
                 q_b = q_r[n_a:]
-                o_loc, lse_loc = _attn_with_lse(
+                o_loc, lse_loc = _attn(
                     q_b,
                     k_all[peer_end:],
                     v_all[peer_end:],
@@ -448,10 +534,10 @@ class HcpRingAttentionImpl(AttentionImpl):
                     qpos0 + n_a - peer_end,
                     self.sliding_window,
                 )
-                o_peer, lse_peer = _attn_with_lse(
+                o_peer, lse_peer = _attn(
                     q_b, k_peer, v_peer, self.scale, None
                 )
-                o_b = _lse_merge(o_loc, lse_loc, o_peer, lse_peer)
+                o_b = _merge(o_loc, lse_loc, o_peer, lse_peer)
                 output[qs + n_a : qe] = o_b.to(output.dtype)
 
         return output
