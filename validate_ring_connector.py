@@ -48,7 +48,7 @@ def build_prompt_ids(total: int) -> list[int]:
     text = " ".join(
         f"Paragraph {i}: the quick brown fox jumps over the lazy dog, "
         f"then counts {i} clouds drifting over mountain {i % 7}."
-        for i in range(512)
+        for i in range(1024)
     )
     ids = tok(text, add_special_tokens=False)["input_ids"]
     assert len(ids) >= total, f"prompt too short: {len(ids)} < {total}"
@@ -117,7 +117,7 @@ def mode_producer(args) -> None:
         dtype="float16",
         enforce_eager=True,
         gpu_memory_utilization=args.producer_gpu_mem,
-        max_model_len=4096,
+        max_model_len=args.max_model_len,
         max_num_seqs=1,
         disable_hybrid_kv_cache_manager=True,
         attention_backend="CUSTOM",
@@ -151,7 +151,7 @@ def mode_consumer(args) -> None:
         dtype="float16",
         enforce_eager=True,
         gpu_memory_utilization=args.gpu_mem,
-        max_model_len=4096,
+        max_model_len=args.max_model_len,
         max_num_seqs=1,
         disable_hybrid_kv_cache_manager=True,
         seed=0,
@@ -192,7 +192,7 @@ def mode_consumer(args) -> None:
         dtype="float16",
         enforce_eager=True,
         gpu_memory_utilization=args.gpu_mem,
-        max_model_len=4096,
+        max_model_len=args.max_model_len,
         max_num_seqs=1,
         disable_hybrid_kv_cache_manager=True,
         enable_prefix_caching=False,
@@ -335,6 +335,7 @@ def main() -> None:
     ap.add_argument("--total", type=int, default=2048)
     ap.add_argument("--split", type=int, default=1024)
     ap.add_argument("--decode", type=int, default=4)
+    ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--port", type=int, default=8901)
     ap.add_argument("--run-id", default="run")
     ap.add_argument("--chunk-id", default="chunk0")
