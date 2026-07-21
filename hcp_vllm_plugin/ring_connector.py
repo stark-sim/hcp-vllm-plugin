@@ -253,7 +253,9 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         rp = (getattr(request, "kv_transfer_params", None) or {}).get(
             "hcp_ring"
         ) or {}
-        prefix_len = int(rp.get("prefix_len") or self._prefix_len)
+        # Presence (not truthiness) decides override, so a request can
+        # explicitly opt out with prefix_len=0 even when globals are set.
+        prefix_len = int(rp["prefix_len"]) if "prefix_len" in rp else self._prefix_len
         if prefix_len == 0:
             return 0, False
         chunk_key = rp.get("chunk_id") or (
@@ -306,7 +308,7 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                         req_id=new_req.req_id,
                         first_block_id=new_req.block_ids[0][0],
                         peer_url=(rp.get("peer_url") or "").rstrip("/"),
-                        prefix_len=int(rp.get("prefix_len") or self._prefix_len),
+                        prefix_len=int(rp["prefix_len"]) if "prefix_len" in rp else self._prefix_len,
                     )
                 )
             elif self._ring_role == "producer":

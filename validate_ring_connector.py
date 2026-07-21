@@ -210,7 +210,9 @@ def mode_consumer(args) -> None:
     from vllm import SamplingParams as _SP
 
     cons.generate([_TP(prompt_token_ids=ids[:32])],
-                  _SP(temperature=0.0, max_tokens=1))
+                  _SP(temperature=0.0, max_tokens=1,
+                      extra_args={"kv_transfer_params":
+                                  {"hcp_ring": {"prefix_len": 0}}}))
 
     # ---- correctness ----
     token_match = cons_tokens == ref_tokens

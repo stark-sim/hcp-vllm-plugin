@@ -209,7 +209,8 @@ def mode_consumer(args) -> None:
     # it).  In continuous serving the next step arrives with the next request;
     # here we submit one tiny non-CP request to trigger that schedule.
     cons.generate([TokensPrompt(prompt_token_ids=full[0][:32])],
-                  sampling(None, 1))
+                  sampling({"kv_transfer_params":
+                            {"hcp_ring": {"prefix_len": 0}}}, 1))
 
     # ---- correctness ----
     token_match = cons_tokens == ref_tokens
