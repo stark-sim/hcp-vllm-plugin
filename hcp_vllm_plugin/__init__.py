@@ -12,12 +12,22 @@ can also be loaded directly via ``kv_connector_module_path``.
 from vllm.distributed.kv_transfer.kv_connector.factory import (
     KVConnectorFactory,
 )
+from vllm.v1.attention.backends.registry import (
+    AttentionBackendEnum,
+    register_backend,
+)
 
 
 def register() -> None:
-    """Register the HCP CP connector with vLLM's connector factory."""
+    """Register the HCP CP connector and the HCP ring attention backend."""
     KVConnectorFactory.register_connector(
         "HcpCpConnector",
         "hcp_vllm_plugin.connector",
         "HcpCpConnector",
+    )
+    # Memory-splitting ring-attention (online-softmax) attention backend.
+    # Select with `--attention-backend CUSTOM` / LLM(attention_backend="CUSTOM").
+    register_backend(
+        AttentionBackendEnum.CUSTOM,
+        "hcp_vllm_plugin.ring_backend.HcpRingAttentionBackend",
     )
