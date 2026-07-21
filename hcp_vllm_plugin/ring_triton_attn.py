@@ -30,7 +30,6 @@ import torch
 from vllm.triton_utils import tl, triton
 
 RCP_LN2 = 1.4426950408889634  # 1 / ln(2)
-LN2 = 0.6931471805599453
 
 
 @triton.jit
@@ -138,7 +137,7 @@ def _ring_fwd_kernel(
     acc = acc / l_i[:, None]
 
     # lse in natural log: exp2-domain max * ln2 + ln(denominator)
-    lse = m_i * LN2 + tl.log(l_i)
+    lse = m_i * 0.6931471805599453 + tl.log(l_i)
     tl.store(
         LSE + cur_head * stride_lh + offs_m,
         lse,
