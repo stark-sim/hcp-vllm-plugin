@@ -169,7 +169,11 @@ def mode_consumer(args) -> None:
     torch.cuda.empty_cache()
 
     # ---- consumer instance (CUSTOM backend + ring connector) ----
-    os.environ["HCP_RING_SPLIT_TOKENS"] = str(args.split)  # fallback only
+    # The HCP_RING_SPLIT_TOKENS env fallback is the legacy no-connector
+    # single-process path; with staged per-request bindings it must stay OFF,
+    # otherwise short non-CP requests (e.g. the flush below) fall into the
+    # split path and the WRITE_TRACK debug check misfires on their own writes.
+    os.environ["HCP_RING_SPLIT_TOKENS"] = "0"
     cfg = {
         "kv_connector": "HcpRingKvConnector",
         "kv_role": "kv_consumer",
