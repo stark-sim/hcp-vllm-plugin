@@ -78,6 +78,21 @@ def clear_peer_kv() -> None:
     PEER_KV_STAGING.clear()
 
 
+# ---------------------------------------------------------------------------
+# Debug write-tracking (validation only).  When enabled, do_kv_cache_update
+# records which paged-pool slots this worker wrote, and forward() cross-checks
+# that no slot belonging to the peer (chunk-A) region was written locally —
+# i.e. the consumer's permanent pool provably never holds chunk-A KV.
+# ---------------------------------------------------------------------------
+WRITE_TRACK: dict = {"enabled": False, "slots": set(), "overlap": 0}
+
+
+def reset_write_tracking() -> None:
+    WRITE_TRACK["enabled"] = True
+    WRITE_TRACK["slots"] = set()
+    WRITE_TRACK["overlap"] = 0
+
+
 def _ring_enabled() -> bool:
     return os.environ.get("HCP_RING_ENABLED", "1") == "1"
 
@@ -241,6 +256,8 @@ class HcpRingAttentionImpl(AttentionImpl):
         block_off = slot_mapping % block_size
         key_cache[block_idx, block_off] = key[:n]
         value_cache[block_idx, block_off] = value[:n]
+        if WRITE_TRACK["enabled"]:
+            WRITE_TRACK["slots"].update(slot_mapping.tolist())
 
     # -- forward -------------------------------------------------------------
     def forward(
@@ -320,6 +337,23 @@ class HcpRingAttentionImpl(AttentionImpl):
             # Ring path.  Queries still inside chunk A (qpos < peer_end) get
             # plain causal attention; queries in chunk B get the merged
             # local(causal, chunk B) + peer(non-causal, chunk A) attention.
+            if WRITE_TRACK["enabled"]:
+                # Debug: prove the peer chunk's pool slots were never written
+                # by this worker (memory-splitting evidence).
+                nb_a = (peer_end + block_size - 1) // block_size
+                blk_a = block_table[r, :nb_a].long()
+                slots_a = (
+                    blk_a[:, None] * block_size
+                    + torch.arange(block_size, device=blk_a.device)[None, :]
+                ).flatten()[:peer_end]
+                overlap = WRITE_TRACK["slots"].intersection(slots_a.tolist())
+                if overlap:
+                    WRITE_TRACK["overlap"] += len(overlap)
+                    logger.warning(
+                        "HCP ring: %d chunk-A pool slots were written locally "
+                        "(expected 0 in a memory-splitting worker)",
+                        len(overlap),
+                    )
             n_a = max(0, min(tq, peer_end - qpos0))
             if n_a > 0:
                 o_a, _ = _attn_with_lse(

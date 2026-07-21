@@ -25,6 +25,14 @@ def register() -> None:
         "hcp_vllm_plugin.connector",
         "HcpCpConnector",
     )
+    # Memory-splitting ring-KV connector: scheduler marks the peer chunk as
+    # externally computed; worker stages peer KV transiently into
+    # ring_backend.PEER_KV_STAGING (never into the paged pool).
+    KVConnectorFactory.register_connector(
+        "HcpRingKvConnector",
+        "hcp_vllm_plugin.ring_connector",
+        "HcpRingKvConnector",
+    )
     # Memory-splitting ring-attention (online-softmax) attention backend.
     # Select with `--attention-backend CUSTOM` / LLM(attention_backend="CUSTOM").
     register_backend(
