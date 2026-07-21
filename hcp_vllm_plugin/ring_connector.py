@@ -120,6 +120,14 @@ class RingReqMeta:
 @dataclass
 class HcpRingConnectorMetadata(KVConnectorMetadata):
     requests: list[RingReqMeta] = field(default_factory=list)
+    # Requests finished between the previous and current steps (copied from
+    # SchedulerOutput, which is populated before build_connector_meta runs).
+    # The worker cleans their staged KV in start_load_kv — BEFORE this step's
+    # forward — because their freed blocks may already have been re-allocated
+    # to requests scheduled in THIS step.  Cleaning only in get_finished
+    # (post-forward) would leave a stale first-block -> chunk binding that a
+    # recycled block id could wrongly attach to a NEW request.
+    finished_req_ids: list[str] = field(default_factory=list)
 
 
 class HcpRingKvConnector(KVConnectorBase_V1):
@@ -293,6 +301,7 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         meta = HcpRingConnectorMetadata()
+        meta.finished_req_ids = sorted(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
             if new_req.req_id in self._requests_need_load:
                 # Consumer: stage the peer chunk KV (no pool slot mapping —
@@ -350,6 +359,9 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         Never writes to the paged pool/block table."""
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, HcpRingConnectorMetadata)
+        # Clean finished requests' staging BEFORE this step's forward (their
+        # recycled blocks may serve new requests scheduled in this step).
+        self._cleanup_finished(metadata.finished_req_ids)
         need = [r for r in metadata.requests if not r.is_store]
         if not need:
             return
@@ -474,7 +486,14 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
         # Loads/saves are synchronous within the step; nothing outstanding.
-        # Free transient staged KV of finished requests (refcounted per chunk).
+        # Belt-and-suspenders: cleanup already ran pre-forward via metadata;
+        # this also covers any path that bypasses connector metadata.
+        self._cleanup_finished(finished_req_ids)
+        return None, None
+
+    def _cleanup_finished(self, finished_req_ids) -> None:
+        """Free transient staged KV of finished requests (refcounted per
+        chunk) and unbind their first-block -> chunk mapping.  Idempotent."""
         for req_id in finished_req_ids:
             live = self._live.pop(req_id, None)
             if live is None:
@@ -492,7 +511,6 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                 )
             else:
                 self._chunk_refs[chunk_key] = refs
-        return None, None
 
     # ------------------------------------------------------------------
     # Misc
