@@ -283,7 +283,8 @@ def mode_all(args) -> None:
     script = os.path.abspath(__file__)
     common = ["--total", str(args.total), "--split", str(args.split),
               "--run-id", args.run_id, "--chunk-id", args.chunk_id,
-              "--port", str(args.port),
+              "--port", str(args.port), "--max-model-len",
+              str(args.max_model_len),
               "--producer-store", args.producer_store,
               "--consumer-store", args.consumer_store,
               "--done-file", args.done_file]
