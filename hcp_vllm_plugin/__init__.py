@@ -1,12 +1,22 @@
-"""HCP vLLM plugin — context-parallel block-KV ring connector.
+"""HCP vLLM plugin — heterogeneous context-parallel ring attention for vLLM.
 
-This package provides a vLLM KV-connector (KVConnectorBase_V1) that lets
-multiple vLLM instances on heterogeneous nodes cooperate on one long sequence
-via context-passing prefill: each instance computes only its own chunk and
-loads the earlier chunks' KV from the previous instance.
+This package lets multiple vLLM instances on heterogeneous nodes (e.g. CUDA +
+ROCm) cooperate on long sequences via memory-splitting context parallelism:
 
-It is registered as a ``vllm.general_plugins`` entry point and the connector
-can also be loaded directly via ``kv_connector_module_path``.
+  * ``HcpRingKvConnector`` (KVConnectorBase_V1): the scheduler marks earlier
+    chunks as externally computed (global RoPE positions, no recompute); the
+    worker fetches their per-layer KV over HTTP and stages it TRANSIENTLY —
+    never into the local paged pool.  Per-request chunk assignment rides on
+    ``SamplingParams(extra_args={"kv_transfer_params": {"hcp_ring": ...}})``,
+    so concurrent requests may reference different peer chunks.
+  * ``HcpRingAttentionBackend`` (registered as CUSTOM): online-softmax merge
+    of local (causal) + peer (transient, non-causal) attention via the
+    plugin's Triton kernel (ring_triton_attn, LSE output, CUDA and ROCm).
+  * ``HcpCpConnector``: earlier full-KV context-passing connector, kept for
+    comparison/reference.
+
+Registered as a ``vllm.general_plugins`` entry point; the connectors can also
+be loaded directly via ``kv_connector_module_path``.
 """
 
 from vllm.distributed.kv_transfer.kv_connector.factory import (
