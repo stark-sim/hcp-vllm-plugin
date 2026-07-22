@@ -29,7 +29,8 @@ pip install -e ./hcp_vllm_plugin
   backend 注册表、`vllm.v1.attention.ops.merge_attn_states`、`vllm.triton_utils`。
 - vLLM 升级后请先跑 `python hcp_vllm_plugin/compat_check.py` 冒烟,再跑
   `validate_ring_connector.py --mode all` 全量验证。
-- 数值容差:fp16 下合并结果与全量 attention 的 logits 差 ~1e-3 量级(greedy token 一致)。
+- 数值容差:kernel 级 vs fp32 参考 ~1e-3(fp16 舍入);端到端 logits 差 ~0.02–0.04,
+  greedy token 与单节点参考逐 token 一致(16k/8k 与跨节点验证实测)。
 
 ## 快速开始(两进程 loopback)
 
@@ -37,11 +38,13 @@ producer(算 chunk A 并供取 KV):
 
 ```python
 LLM(model=..., attention_backend="CUSTOM",
+    disable_hybrid_kv_cache_manager=True,   # 全部验证均携带此项
     kv_transfer_config={
         "kv_connector": "HcpRingKvConnector",
         "kv_role": "kv_producer",
         "kv_connector_extra_config": {
             "ring_role": "producer",
+            "ring_chunk_id": "c0",          # 本实例保存 KV 用的 chunk key
             "ring_shared_path": "/tmp/hcp_ring_prod",
             "ring_run_id": "demo",
             "ring_serve_port": 8901,      # 跨节点时绑 0.0.0.0
@@ -63,7 +66,8 @@ LLM(model=..., attention_backend="CUSTOM",
             "ring_shared_path": "/tmp/hcp_ring_cons",
             "ring_run_id": "demo",
         },
-    })
+    },
+    disable_hybrid_kv_cache_manager=True)
 # 每个请求用 SamplingParams 声明自己的 peer chunk:
 SamplingParams(
     temperature=0, max_tokens=...,
