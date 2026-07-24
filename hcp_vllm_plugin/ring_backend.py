@@ -49,15 +49,17 @@ Configuration (env vars):
 
 Peer KV staging API (used by HcpRingKvConnector):
   stage_peer_kv(chunk_key, layer_name, k, v) / drop_chunk_kv / clear_peer_kv
-  map_request_peer(first_block_id, chunk_key) / unmap_request_peer
+  map_request_peer(first_block_id, chunk_keys) / unmap_request_peer
   k/v: [num_tokens, num_kv_heads, head_dim] contiguous, post-RoPE K.
-  Staging is keyed by (chunk_key, layer_name); each request is bound to its
-  chunk via PEER_REQ_MAP[first_block_id], so multiple requests with different
-  peer chunks can batch concurrently.  When a request's row has staged peer
-  KV it is used as the peer (chunk-A) KV and the first `k.shape[0]` positions
-  of the local cache are excluded from the local path.  Without staged KV,
-  HCP_RING_SPLIT_TOKENS splits the local paged cache instead (single-process
-  validation path).
+  Staging is keyed by (chunk_key, layer_name); each request is bound to an
+  ORDERED list of prefix chunk keys via PEER_REQ_MAP[first_block_id], so
+  multiple requests with different peer chunk sets can batch concurrently.
+  The ordered chunks are a globally contiguous prefix: forward() concatenates
+  them into one peer KV segment and runs a single non-causal peer pass.
+  When a request's row has staged peer KV it is used as the peer (chunk-A) KV
+  and the first `k.shape[0]` positions of the local cache are excluded from
+  the local path.  Without staged KV, HCP_RING_SPLIT_TOKENS splits the local
+  paged cache instead (single-process validation path).
 """
 
 import os
@@ -79,14 +81,16 @@ logger = init_logger(__name__)
 #
 # Multi-request design:
 #   PEER_KV_STAGING is keyed by (chunk_key, layer_name) so that several
-#   requests — each with its own peer chunk — can be in flight concurrently.
-#   PEER_REQ_MAP maps a request's FIRST block-table block id (stable for the
-#   request's whole lifetime) to its peer chunk key.  The connector registers
-#   the mapping when it stages the chunk and unregisters it when the request
-#   finishes, so block-id reuse by the allocator is safe.
+#   requests — each with its own peer chunk set — can be in flight
+#   concurrently.  PEER_REQ_MAP maps a request's FIRST block-table block id
+#   (stable for the request's whole lifetime) to its ORDERED list of prefix
+#   chunk keys (the chunks form a globally contiguous prefix of the request).
+#   The connector registers the mapping when it stages the chunks and
+#   unregisters it when the request finishes, so block-id reuse by the
+#   allocator is safe.
 # ---------------------------------------------------------------------------
 PEER_KV_STAGING: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
-PEER_REQ_MAP: dict[int, str] = {}
+PEER_REQ_MAP: dict[int, list[str]] = {}
 
 
 def stage_peer_kv(
@@ -108,15 +112,22 @@ def drop_chunk_kv(chunk_key: str) -> int:
     return len(keys)
 
 
-def map_request_peer(first_block_id: int, chunk_key: str) -> None:
-    PEER_REQ_MAP[first_block_id] = chunk_key
+def map_request_peer(first_block_id: int, chunk_keys) -> None:
+    """Bind a request (by first block id) to its ordered prefix chunk keys.
+
+    Accepts a single chunk key (str) or an ordered list/tuple of keys; a
+    single key is treated as a one-element list (backward compat).
+    """
+    if isinstance(chunk_keys, str):
+        chunk_keys = [chunk_keys]
+    PEER_REQ_MAP[first_block_id] = list(chunk_keys)
 
 
 def unmap_request_peer(first_block_id: int) -> None:
     PEER_REQ_MAP.pop(first_block_id, None)
 
 
-def request_peer_chunk(first_block_id: int) -> str | None:
+def request_peer_chunk(first_block_id: int) -> list[str] | None:
     return PEER_REQ_MAP.get(first_block_id)
 
 
@@ -471,22 +482,44 @@ class HcpRingAttentionImpl(AttentionImpl):
             q_r = query[qs:qe]
             qpos0 = tk - tq  # global position of this request's first query
 
-            # Determine the peer (chunk-A) KV for THIS request.  Lookup is
-            # per-row: the request's first block id identifies its staged
-            # peer chunk (registered by the KV connector).  PoC convenience:
-            # with no mapping and exactly ONE staged chunk (single-request,
+            # Determine the peer (prefix) KV for THIS request.  Lookup is
+            # per-row: the request's first block id identifies its ORDERED
+            # staged prefix chunks (registered by the KV connector).  The
+            # chunks form a globally contiguous prefix, so they are
+            # concatenated into one contiguous peer KV segment and consumed
+            # with a single non-causal peer pass (linear copy, mathematically
+            # equivalent to N-1 separate passes).  PoC convenience: with no
+            # mapping and exactly ONE staged chunk (single-request,
             # no-connector runs such as validate_ring_backend customst),
             # use that chunk.
             staged = None
             if _ring_enabled():
-                ck = PEER_REQ_MAP.get(int(block_table[r, 0]))
-                if ck is not None:
-                    staged = PEER_KV_STAGING.get((ck, layer.layer_name))
-                else:
+                ck_list = PEER_REQ_MAP.get(int(block_table[r, 0]))
+                if ck_list is None:
                     chunks = {key[0] for key in PEER_KV_STAGING}
                     if len(chunks) == 1:
-                        staged = PEER_KV_STAGING.get(
-                            (next(iter(chunks)), layer.layer_name)
+                        ck_list = [next(iter(chunks))]
+                if ck_list:
+                    parts = []
+                    for ck in ck_list:
+                        kv = PEER_KV_STAGING.get((ck, layer.layer_name))
+                        if kv is None:
+                            parts = None
+                            break
+                        parts.append(kv)
+                    if parts is None:
+                        logger.warning(
+                            "HCP ring: request mapped to chunks %s but staging "
+                            "incomplete at layer %s; falling back to local path",
+                            ck_list,
+                            layer.layer_name,
+                        )
+                    elif len(parts) == 1:
+                        staged = parts[0]
+                    else:
+                        staged = (
+                            torch.cat([p[0] for p in parts], dim=0),
+                            torch.cat([p[1] for p in parts], dim=0),
                         )
             if staged is not None:
                 k_peer, v_peer = staged

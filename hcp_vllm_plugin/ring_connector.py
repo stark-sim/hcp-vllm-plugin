@@ -17,32 +17,44 @@ which is deliberately DIFFERENT from the stock disaggregated-prefill semantics
     attention (online-softmax merge) and that can be discarded after use.
 
 Roles (``kv_connector_extra_config``):
-  - ``ring_role``: "producer" | "consumer"
+  - ``ring_role``: "producer" | "consumer" | "relay"
       producer: prompt is its own chunk; computes it, saves per-layer K/V to
                 its store and serves the store over HTTP (worker side only).
       consumer: prompt is the FULL sequence; the prefix (earlier chunk) is
                 marked external so only the suffix is computed; peer KV is
                 fetched from the producer into the ring backend's staging.
+      relay   : consumer + producer in one instance (N>2 ring middle node):
+                the prompt is prefix + own chunk; the prefix is marked
+                external (fetched transiently like a consumer) AND the own
+                chunk's computed KV is saved to its store / served over HTTP
+                (like a producer).  The ready state cascades: a relay's
+                _READY marker is written only after its forward completes,
+                which in turn required its own prefix chunks to be staged.
 
 Config keys (``kv_connector_extra_config``):
-  - ``ring_role``             : "producer" | "consumer"
+  - ``ring_role``             : "producer" | "consumer" | "relay"
   - ``ring_shared_path``      : local store dir (this instance's side)
   - ``ring_run_id``           : session id namespacing the store
-  - ``ring_chunk_id``         : this instance's own chunk key (producer)
-  - ``ring_prefix_chunk_ids`` : comma-separated prefix chunk keys (consumer;
-                                PoC supports exactly one)
-  - ``ring_prefix_len``       : number of prefix (peer chunk) tokens (consumer)
+  - ``ring_chunk_id``         : this instance's own chunk key (producer/relay)
+  - ``ring_prefix_chunk_ids`` : comma-separated prefix chunk keys, ordered
+                                (consumer/relay; any number of chunks)
+  - ``ring_prefix_len``       : total number of prefix (peer chunk) tokens
+                                (consumer/relay)
   - ``ring_peer_url``         : producer base URL, e.g. "http://127.0.0.1:8901"
-                                (consumer; empty => local shared-path read)
-  - ``ring_serve_port``       : HTTP port to serve the store on (producer)
-  - ``ring_load_timeout_s``   : HTTP fetch timeout (consumer)
+                                (consumer/relay; empty => local shared-path read)
+  - ``ring_serve_port``       : HTTP port to serve the store on (producer/relay)
+  - ``ring_load_timeout_s``   : HTTP fetch timeout (consumer/relay)
 
 Per-request overrides (multi-request / continuous batching):
   Each request may carry ``SamplingParams(extra_args={"kv_transfer_params":
-  {"hcp_ring": {...}}})`` with keys ``chunk_id``, ``prefix_len``, ``peer_url``.
+  {"hcp_ring": {...}}})`` with keys ``chunk_ids`` (list or comma string,
+  ordered prefix chunks), ``peer_urls`` (list or comma string, aligned with
+  ``chunk_ids``; missing entries fall back to the global peer url), and
+  ``prefix_len`` (total prefix tokens).  The singular ``chunk_id`` /
+  ``peer_url`` forms are still accepted and treated as one-element lists.
   These take precedence over the global extra-config values, so concurrent
-  requests can reference DIFFERENT peer chunks.  The worker stages each chunk
-  under its own key and binds it to the request via the request's first
+  requests can reference DIFFERENT peer chunk sets.  The worker stages each
+  chunk under its own key and binds it to the request via the request's first
   block-table block id (see ``ring_backend.PEER_REQ_MAP``); staged KV and the
   mapping are freed when the request finishes.
 
@@ -104,16 +116,48 @@ def _ring_params_from_sampling(sampling_params: Any) -> dict[str, Any]:
     return dict(kv_params.get("hcp_ring") or {})
 
 
+def _as_str_list(value: Any) -> list[str]:
+    """Accept a list/tuple or comma-separated string; return a clean list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [s for s in value.split(",") if s]
+    return [str(s) for s in value]
+
+
+def _chunks_and_urls(rp: dict[str, Any], global_ids: list[str]) -> tuple[list[str], list[str]]:
+    """Ordered prefix chunk keys + per-chunk peer urls ("" = global fallback).
+
+    Plural ``chunk_ids`` / ``peer_urls`` win; the singular ``chunk_id`` /
+    ``peer_url`` forms are treated as one-element lists (backward compat).
+    """
+    ids = _as_str_list(rp.get("chunk_ids"))
+    if not ids and rp.get("chunk_id"):
+        ids = [str(rp["chunk_id"])]
+    if not ids:
+        ids = list(global_ids)
+    urls = _as_str_list(rp.get("peer_urls"))
+    if not urls and rp.get("peer_url"):
+        urls = [str(rp["peer_url"])]
+    urls = [u.rstrip("/") for u in urls]
+    urls += [""] * (len(ids) - len(urls))
+    return ids, urls
+
+
 @dataclass
 class RingReqMeta:
     is_store: bool
+    # Store side: this instance's own chunk key.  Load side: unused ("").
     chunk_key: str
     # Store side only: paged-pool slots of this instance's own chunk tokens.
     slot_mapping: torch.Tensor | None = None
     # Load side only: request binding + per-request fetch parameters.
     req_id: str = ""
     first_block_id: int = -1
-    peer_url: str = ""
+    # Load side only: ordered prefix chunk keys + aligned per-chunk peer urls
+    # ("" = use the connector's global peer url / local store).
+    chunk_keys: list[str] = field(default_factory=list)
+    peer_urls: list[str] = field(default_factory=list)
     prefix_len: int = 0
 
 
@@ -145,6 +189,11 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         cfg = self._kv_transfer_config
         self._block_size = vllm_config.cache_config.block_size
         self._ring_role = cfg.get_from_extra_config("ring_role", "producer")
+        if self._ring_role not in ("producer", "consumer", "relay"):
+            raise ValueError(
+                f"HcpRingKvConnector: unknown ring_role {self._ring_role!r} "
+                "(expected producer|consumer|relay)"
+            )
         self._shared_path = cfg.get_from_extra_config(
             "ring_shared_path", "/tmp/hcp_ring_kv"
         )
@@ -163,14 +212,16 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         self._saved_tokens: dict[str, int] = {}
         self._saved_layers: dict[str, int] = {}
         # Worker-side live-request bookkeeping for cleanup:
-        #   req_id -> (chunk_key, first_block_id); chunk_key -> refcount
-        self._live: dict[str, tuple[str, int]] = {}
+        #   req_id -> (first_block_id, [chunk_keys]); chunk_key -> refcount;
+        #   chunk_key -> staged token count (per layer)
+        self._live: dict[str, tuple[int, list[str]]] = {}
         self._chunk_refs: dict[str, int] = {}
+        self._chunk_lens: dict[str, int] = {}
         os.makedirs(self._run_dir(), exist_ok=True)
-        # Only the producer's WORKER-side connector holds/serves KV; the
+        # Producer/relay WORKER-side connectors hold/serve KV; the
         # scheduler-side instance must not bind the HTTP port.
         if (
-            self._ring_role == "producer"
+            self._ring_role in ("producer", "relay")
             and self._serve_port > 0
             and self._role == KVConnectorRole.WORKER
         ):
@@ -253,11 +304,11 @@ class HcpRingKvConnector(KVConnectorBase_V1):
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
-        if self._ring_role != "consumer":
+        if self._ring_role not in ("consumer", "relay"):
             return 0, False
 
         # Per-request params (kv_transfer_params.hcp_ring) override globals,
-        # so concurrent requests may reference different peer chunks.
+        # so concurrent requests may reference different peer chunk sets.
         rp = (getattr(request, "kv_transfer_params", None) or {}).get(
             "hcp_ring"
         ) or {}
@@ -266,17 +317,16 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         prefix_len = int(rp["prefix_len"]) if "prefix_len" in rp else self._prefix_len
         if prefix_len == 0:
             return 0, False
-        chunk_key = rp.get("chunk_id") or (
-            self._prefix_chunk_ids[0] if self._prefix_chunk_ids else ""
-        )
-        if not chunk_key:
+        chunk_ids, peer_urls = _chunks_and_urls(rp, self._prefix_chunk_ids)
+        if not chunk_ids:
             return 0, False
-        peer_url = (rp.get("peer_url") or "").rstrip("/")
 
-        # Wait until the peer chunk's KV is fully written by the producer.
-        if not self._prefix_ready(chunk_key, peer_url):
-            # None => scheduler asks again later (async stall).
-            return None, True
+        # Wait until ALL prefix chunks' KV are fully written by their
+        # producers (ready state cascades down the ring).
+        for chunk_key, peer_url in zip(chunk_ids, peer_urls):
+            if not self._prefix_ready(chunk_key, peer_url):
+                # None => scheduler asks again later (async stall).
+                return None, True
 
         external = _align_down(prefix_len, self._block_size)
         external = max(external - num_computed_tokens, 0)
@@ -303,60 +353,69 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         meta = HcpRingConnectorMetadata()
         meta.finished_req_ids = sorted(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
+            rp = _ring_params_from_sampling(new_req.sampling_params)
             if new_req.req_id in self._requests_need_load:
-                # Consumer: stage the peer chunk KV (no pool slot mapping —
-                # we deliberately do NOT load into the block table).
-                rp = _ring_params_from_sampling(new_req.sampling_params)
-                chunk_key = rp.get("chunk_id") or (
-                    self._prefix_chunk_ids[0] if self._prefix_chunk_ids else ""
-                )
+                # Consumer/relay: stage the prefix chunks' KV (no pool slot
+                # mapping — we deliberately do NOT load into the block table).
+                chunk_ids, peer_urls = _chunks_and_urls(rp, self._prefix_chunk_ids)
                 meta.requests.append(
                     RingReqMeta(
                         is_store=False,
-                        chunk_key=chunk_key,
+                        chunk_key="",
                         req_id=new_req.req_id,
                         first_block_id=new_req.block_ids[0][0],
-                        peer_url=(rp.get("peer_url") or "").rstrip("/"),
+                        chunk_keys=chunk_ids,
+                        peer_urls=peer_urls,
                         prefix_len=int(rp["prefix_len"]) if "prefix_len" in rp else self._prefix_len,
                     )
                 )
-            elif self._ring_role == "producer":
-                # Producer: save this instance's own chunk KV after compute.
+            if self._ring_role in ("producer", "relay"):
+                # Producer/relay: save this instance's own chunk KV after
+                # compute.  On a relay the own chunk is the request's suffix:
+                # the external prefix is skipped in the slot mapping.
                 token_ids = new_req.prompt_token_ids or []
                 block_ids = list(new_req.block_ids[0])
-                rp = _ring_params_from_sampling(new_req.sampling_params)
                 chunk_key = rp.get("chunk_id") or self._chunk_id
-                meta.requests.append(
-                    RingReqMeta(
-                        is_store=True,
-                        chunk_key=chunk_key,
-                        slot_mapping=self._make_slot_mapping(token_ids, block_ids),
+                skip = 0
+                if self._ring_role == "relay":
+                    plen = int(rp["prefix_len"]) if "prefix_len" in rp else self._prefix_len
+                    skip = _align_down(plen, self._block_size)
+                slot_mapping = self._make_slot_mapping(token_ids, block_ids, skip)
+                if slot_mapping.shape[0] > 0:
+                    meta.requests.append(
+                        RingReqMeta(
+                            is_store=True,
+                            chunk_key=chunk_key,
+                            slot_mapping=slot_mapping,
+                        )
                     )
-                )
         self._requests_need_load.clear()
         return meta
 
     def _make_slot_mapping(
-        self, token_ids: list[int], block_ids: list[int]
+        self, token_ids: list[int], block_ids: list[int], skip: int = 0
     ) -> torch.Tensor:
         n = _align_down(len(token_ids), self._block_size)
-        block_ids_t = torch.tensor(block_ids[: (n // self._block_size)])
+        block_ids_t = torch.tensor(block_ids[skip // self._block_size : n // self._block_size])
         num_blocks = block_ids_t.shape[0]
+        if num_blocks == 0:
+            return torch.empty(0, dtype=torch.long)
         offsets = torch.arange(0, self._block_size)
         slot_mapping = (
             offsets.reshape((1, self._block_size))
             + block_ids_t.reshape((num_blocks, 1)) * self._block_size
-        ).flatten()[:n]
+        ).flatten()[: n - skip]
         return slot_mapping
 
     # ------------------------------------------------------------------
     # Worker side
     # ------------------------------------------------------------------
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        """Fetch each request's peer chunk per-layer KV into the ring backend's
-        TRANSIENT staging dict (keyed by chunk), bind the request to its chunk
-        via its first block-table block id, and track it for cleanup on finish.
-        Never writes to the paged pool/block table."""
+        """Fetch each request's prefix chunks' per-layer KV into the ring
+        backend's TRANSIENT staging dict (keyed by chunk), bind the request to
+        its ordered chunk list via its first block-table block id, and track
+        them for cleanup on finish.  Never writes to the paged pool/block
+        table."""
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, HcpRingConnectorMetadata)
         # Clean finished requests' staging BEFORE this step's forward (their
@@ -366,10 +425,15 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         if not need:
             return
         for req in need:
-            expected = _align_down(
+            expected_total = _align_down(
                 req.prefix_len or self._prefix_len, self._block_size
             )
-            if req.chunk_key not in self._chunk_refs:
+            staged_total = 0
+            for chunk_key, peer_url in zip(req.chunk_keys, req.peer_urls):
+                if chunk_key in self._chunk_refs:
+                    # Already staged by another live request.
+                    staged_total += self._chunk_lens.get(chunk_key, 0)
+                    continue
                 # First live request referencing this chunk: stage all layers.
                 staged = 0
                 total_bytes = 0
@@ -381,40 +445,43 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                         else "cuda"
                     )
                     tensors = self._load_layer(
-                        req.chunk_key, layer_name, device, req.peer_url
+                        chunk_key, layer_name, device, peer_url
                     )
                     if tensors is None:
                         raise RuntimeError(
                             "HcpRingKvConnector: peer KV fetch failed for "
-                            f"{req.chunk_key}/{layer_name} "
-                            f"(peer={req.peer_url or self._peer_url})"
+                            f"{chunk_key}/{layer_name} "
+                            f"(peer={peer_url or self._peer_url})"
                         )
                     k, v = tensors
-                    if k.shape[0] != expected:
-                        raise RuntimeError(
-                            f"HcpRingKvConnector: staged peer KV length "
-                            f"{k.shape[0]} != expected external prefix "
-                            f"{expected} for {layer_name}"
-                        )
-                    stage_peer_kv(req.chunk_key, layer_name, k, v)
+                    stage_peer_kv(chunk_key, layer_name, k, v)
                     staged += 1
                     total_bytes += k.numel() * k.element_size() * 2
+                self._chunk_lens[chunk_key] = k.shape[0]
+                staged_total += k.shape[0]
                 logger.info(
                     "HcpRingKvConnector: staged peer chunk %s KV for %d layers "
                     "(%d tokens/layer, %.1f MiB over %s) into TRANSIENT staging "
                     "(paged pool untouched)",
-                    req.chunk_key,
+                    chunk_key,
                     staged,
-                    expected,
+                    k.shape[0],
                     total_bytes / 2**20,
-                    req.peer_url or self._peer_url or "local store",
+                    peer_url or self._peer_url or "local store",
                 )
-            # Bind this request to its chunk and track it for cleanup.
-            map_request_peer(req.first_block_id, req.chunk_key)
-            self._live[req.req_id] = (req.chunk_key, req.first_block_id)
-            self._chunk_refs[req.chunk_key] = (
-                self._chunk_refs.get(req.chunk_key, 0) + 1
-            )
+            if staged_total != expected_total:
+                raise RuntimeError(
+                    f"HcpRingKvConnector: staged prefix length {staged_total} "
+                    f"!= expected external prefix {expected_total} "
+                    f"(chunks={req.chunk_keys})"
+                )
+            # Bind this request to its ordered chunk set and track for cleanup.
+            map_request_peer(req.first_block_id, req.chunk_keys)
+            self._live[req.req_id] = (req.first_block_id, list(req.chunk_keys))
+            for chunk_key in req.chunk_keys:
+                self._chunk_refs[chunk_key] = (
+                    self._chunk_refs.get(chunk_key, 0) + 1
+                )
 
     def _load_layer(
         self, chunk_key: str, layer_name: str, device: str, peer_url: str = ""
@@ -493,24 +560,26 @@ class HcpRingKvConnector(KVConnectorBase_V1):
 
     def _cleanup_finished(self, finished_req_ids) -> None:
         """Free transient staged KV of finished requests (refcounted per
-        chunk) and unbind their first-block -> chunk mapping.  Idempotent."""
+        chunk) and unbind their first-block -> chunks mapping.  Idempotent."""
         for req_id in finished_req_ids:
             live = self._live.pop(req_id, None)
             if live is None:
                 continue
-            chunk_key, first_block_id = live
+            first_block_id, chunk_keys = live
             unmap_request_peer(first_block_id)
-            refs = self._chunk_refs.get(chunk_key, 0) - 1
-            if refs <= 0:
-                self._chunk_refs.pop(chunk_key, None)
-                dropped = drop_chunk_kv(chunk_key)
-                logger.info(
-                    "HcpRingKvConnector: freed staged chunk %s (%d layers)",
-                    chunk_key,
-                    dropped,
-                )
-            else:
-                self._chunk_refs[chunk_key] = refs
+            for chunk_key in chunk_keys:
+                refs = self._chunk_refs.get(chunk_key, 0) - 1
+                if refs <= 0:
+                    self._chunk_refs.pop(chunk_key, None)
+                    self._chunk_lens.pop(chunk_key, None)
+                    dropped = drop_chunk_kv(chunk_key)
+                    logger.info(
+                        "HcpRingKvConnector: freed staged chunk %s (%d layers)",
+                        chunk_key,
+                        dropped,
+                    )
+                else:
+                    self._chunk_refs[chunk_key] = refs
 
     # ------------------------------------------------------------------
     # Misc
@@ -523,9 +592,10 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         # Engine teardown: drop any staged KV still referenced.  (During
         # continuous serving, cleanup happens one step after a request
         # finishes via get_finished; anything left at shutdown is the tail.)
-        for _, (_, first_block_id) in list(self._live.items()):
+        for first_block_id, _ in list(self._live.values()):
             unmap_request_peer(first_block_id)
         for chunk_key in list(self._chunk_refs):
             drop_chunk_kv(chunk_key)
         self._live.clear()
         self._chunk_refs.clear()
+        self._chunk_lens.clear()
