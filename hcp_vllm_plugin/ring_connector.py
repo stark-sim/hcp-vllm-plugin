@@ -160,7 +160,14 @@ def _chunks_and_urls(
     if not urls and global_urls:
         urls = list(global_urls)
     urls = [u.rstrip("/") for u in urls]
-    urls += [""] * (len(ids) - len(urls))
+    if urls and len(urls) < len(ids):
+        # Neighbor accumulate-forward: one predecessor serves the WHOLE
+        # accumulated prefix, so a shorter url list is extended with its
+        # last entry (NOT with "", which would wrongly fall back to the
+        # local store / global peer and stall the readiness check forever).
+        urls += [urls[-1]] * (len(ids) - len(urls))
+    else:
+        urls += [""] * (len(ids) - len(urls))
     return ids, urls
 
 
