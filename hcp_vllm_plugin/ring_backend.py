@@ -166,6 +166,13 @@ def register_decode_ring(
     first_block_id: int, peer_chunks: list[tuple[str, str]], prefix_len: int
 ) -> None:
     """peer_chunks: ordered (chunk_key, peer_url) pairs of the prefix."""
+    logger.info(
+        "HCP decode-ring probe: register key=%s type=%s peers=%s prefix_len=%s",
+        first_block_id,
+        type(first_block_id).__name__,
+        peer_chunks,
+        prefix_len,
+    )
     DECODE_RING_MAP[first_block_id] = {
         "peer_chunks": [(ck, u) for ck, u in peer_chunks if u],
         "prefix_len": prefix_len,
@@ -541,6 +548,13 @@ class HcpRingAttentionImpl(AttentionImpl):
             # local partial (own chunk + decode growth, causal) merged with
             # each peer's remote partial (its chunk snapshot, non-causal).
             dr = None
+            if tq == 1:
+                logger.info(
+                    "HCP decode-ring probe: tq=1 enabled=%s key=%s map_keys=%s",
+                    _decode_ring_enabled(),
+                    int(block_table[r, 0]),
+                    list(DECODE_RING_MAP.keys()),
+                )
             if _decode_ring_enabled() and tq == 1:
                 dr = DECODE_RING_MAP.get(int(block_table[r, 0]))
             if dr is not None:
