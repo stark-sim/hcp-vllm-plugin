@@ -220,6 +220,10 @@ def mode_all(args) -> None:
         procs.append(p)
         logs.append(f"/tmp/ring_closure_node{k}.log")
         print(f"node{k} pid={p.pid} pred={pred} log={logs[-1]}", flush=True)
+        # Stagger engine starts: concurrent inits race on free-memory
+        # profiling and the later ones can fail KV-cache sizing.
+        if k < args.nnodes - 1:
+            time.sleep(args.start_delay)
 
     # Wait for all nodes to finish their requests (RINGNODE_DONE in logs).
     t0 = time.time()
@@ -296,8 +300,10 @@ def main() -> None:
     ap.add_argument("--ref-file", default="/tmp/hcp_closure_refs.json")
     ap.add_argument("--done-file", default="/tmp/hcp_closure_done")
     ap.add_argument("--hold-secs", type=int, default=900)
-    ap.add_argument("--gpu-mem", type=float, default=0.18)
+    ap.add_argument("--gpu-mem", type=float, default=0.22)
     ap.add_argument("--gpu-mem-ref", type=float, default=0.2)
+    ap.add_argument("--start-delay", type=int, default=45,
+                    help="seconds between ringnode engine starts (mode all)")
     args = ap.parse_args()
 
     if args.mode == "ref":
