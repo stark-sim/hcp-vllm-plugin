@@ -31,7 +31,6 @@ link RTT — exactly the quantity the experiment wants to expose.
 
 from __future__ import annotations
 
-import io
 import os
 import threading
 import urllib.request
@@ -133,7 +132,7 @@ class PartialAttentionService:
 
     def handle(self, payload: bytes) -> bytes:
         """Merge a remote accumulator with this chunk's partial attention."""
-        tensors = safetensors.torch.load(io.BytesIO(payload))
+        tensors = safetensors.torch.load(payload)
         chunk = bytes(tensors["chunk"].tolist()).decode()
         layer = bytes(tensors["layer"].tolist()).decode()
         q = tensors["q"].to(self._device, self._dtype)
@@ -218,7 +217,7 @@ def merge_remote_partial(
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                out = safetensors.torch.load(io.BytesIO(resp.read()))
+                out = safetensors.torch.load(resp.read())
             return (
                 out["o"].to(q.device, q.dtype),
                 out["lse"].to(q.device, torch.float32),
