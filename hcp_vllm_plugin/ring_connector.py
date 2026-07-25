@@ -102,8 +102,11 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from hcp_vllm_plugin.ring_backend import (
+    clear_decode_ring,
     drop_chunk_kv,
     map_request_peer,
+    register_decode_ring,
+    set_staging_release_fn,
     stage_peer_kv,
     unmap_request_peer,
 )
@@ -277,6 +280,9 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         self._live: dict[str, tuple[int, list[str]]] = {}
         self._chunk_refs: dict[str, int] = {}
         self._chunk_lens: dict[str, int] = {}
+        # req_id -> first_block_id, for finish-time decode-ring clearing
+        # (the _live entry may already be released at decode start).
+        self._ring_blocks: dict[str, int] = {}
         os.makedirs(self._run_dir(), exist_ok=True)
         # Producer-side WORKER connectors hold/serve KV; the scheduler-side
         # instance must not bind the HTTP port.
@@ -286,6 +292,9 @@ class HcpRingKvConnector(KVConnectorBase_V1):
             and self._role == KVConnectorRole.WORKER
         ):
             self._start_http_server()
+        # Decode-ring: let the backend release staged prefix KV (refcount
+        # aware) when a request enters the decode phase.
+        set_staging_release_fn(self._release_request_staging)
         logger.info(
             "HcpRingKvConnector init: role=%s chunk=%s prefix=%s(%d) path=%s "
             "peer=%s serve=%d",
@@ -302,17 +311,43 @@ class HcpRingKvConnector(KVConnectorBase_V1):
     # HTTP transport (same pattern as HcpCpConnector)
     # ------------------------------------------------------------------
     def _start_http_server(self) -> None:
-        from functools import partial
-        from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+        from http.server import ThreadingHTTPServer
 
-        handler = partial(SimpleHTTPRequestHandler, directory=self._shared_path)
+        partial_service = None
+        if os.environ.get("HCP_RING_DECODE_RING", "0") == "1":
+            from hcp_vllm_plugin.ring_decode import (
+                PartialAttentionService,
+                make_handler,
+            )
+
+            partial_chunks = [
+                s
+                for s in self._kv_transfer_config.get_from_extra_config(
+                    "ring_partial_chunks", self._chunk_id
+                ).split(",")
+                if s
+            ]
+            partial_service = PartialAttentionService(
+                self._run_dir(), partial_chunks
+            )
+            handler = make_handler(partial_service, self._shared_path)
+        else:
+            from functools import partial
+            from http.server import SimpleHTTPRequestHandler
+
+            handler = partial(
+                SimpleHTTPRequestHandler, directory=self._shared_path
+            )
         server = ThreadingHTTPServer(("0.0.0.0", self._serve_port), handler)
         server.daemon_threads = True
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
         self._http_server = server
+        self._partial_service = partial_service
         logger.info(
-            "HcpRingKvConnector serving KV store on 0.0.0.0:%d", self._serve_port
+            "HcpRingKvConnector serving KV store on 0.0.0.0:%d (partial_attn=%s)",
+            self._serve_port,
+            partial_service is not None,
         )
 
     def _fetch(self, rel_path: str, dest_path: str, peer_url: str = "") -> bool:
@@ -572,6 +607,16 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                 self._chunk_refs[chunk_key] = (
                     self._chunk_refs.get(chunk_key, 0) + 1
                 )
+            # Decode-ring: register the accumulator-ring endpoints for this
+            # request ((chunk, url) pairs in prefix order).  The backend
+            # switches the request to remote partial merges at decode start
+            # and releases the staged KV via the release callback.
+            pairs = [
+                (ck, (u or self._peer_url).rstrip("/"))
+                for ck, u in zip(req.chunk_keys, req.peer_urls)
+            ]
+            register_decode_ring(req.first_block_id, pairs, expected_total)
+            self._ring_blocks[req.req_id] = req.first_block_id
 
     def _load_layer(
         self, chunk_key: str, layer_name: str, device: str, peer_url: str = ""
@@ -648,13 +693,13 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         self._cleanup_finished(finished_req_ids)
         return None, None
 
-    def _cleanup_finished(self, finished_req_ids) -> None:
-        """Free transient staged KV of finished requests (refcounted per
-        chunk) and unbind their first-block -> chunks mapping.  Idempotent."""
-        for req_id in finished_req_ids:
-            live = self._live.pop(req_id, None)
-            if live is None:
-                continue
+    def _release_live_entry(self, req_id: str, clear_ring: bool = True) -> None:
+        """Release one live request's staged KV (refcounted per chunk) and
+        unbind its first-block -> chunks mapping.  Idempotent.  clear_ring
+        also drops the decode-ring registration (only at request finish —
+        decode steps need it for the whole decode phase)."""
+        live = self._live.pop(req_id, None)
+        if live is not None:
             first_block_id, chunk_keys = live
             unmap_request_peer(first_block_id)
             for chunk_key in chunk_keys:
@@ -670,6 +715,27 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                     )
                 else:
                     self._chunk_refs[chunk_key] = refs
+        if clear_ring:
+            fb = self._ring_blocks.pop(req_id, None)
+            if fb is not None:
+                clear_decode_ring(fb)
+
+    def _release_request_staging(self, first_block_id: int) -> None:
+        """Decode-ring callback: free a request's staged prefix KV at decode
+        start (looked up by first block id; the decode-ring registration is
+        kept for the decode phase)."""
+        req_id = next(
+            (rid for rid, (fb, _) in self._live.items() if fb == first_block_id),
+            None,
+        )
+        if req_id is not None:
+            self._release_live_entry(req_id, clear_ring=False)
+
+    def _cleanup_finished(self, finished_req_ids) -> None:
+        """Free transient staged KV of finished requests (refcounted per
+        chunk) and unbind their first-block -> chunks mapping.  Idempotent."""
+        for req_id in finished_req_ids:
+            self._release_live_entry(req_id)
 
     # ------------------------------------------------------------------
     # Misc
@@ -686,6 +752,9 @@ class HcpRingKvConnector(KVConnectorBase_V1):
             unmap_request_peer(first_block_id)
         for chunk_key in list(self._chunk_refs):
             drop_chunk_kv(chunk_key)
+        for fb in list(self._ring_blocks.values()):
+            clear_decode_ring(fb)
         self._live.clear()
         self._chunk_refs.clear()
         self._chunk_lens.clear()
+        self._ring_blocks.clear()

@@ -136,6 +136,60 @@ def clear_peer_kv() -> None:
     PEER_REQ_MAP.clear()
 
 
+# ---------------------------------------------------------------------------
+# Memory-split decode (accumulator ring).  When HCP_RING_DECODE_RING=1, a
+# request that has registered decode-ring info (its prefix chunks' peer
+# endpoints + prefix length) switches at decode time: its transiently staged
+# prefix KV is DROPPED (the owner keeps only its own chunk + decode growth),
+# and each decode step's attention is computed as the online-softmax
+# accumulator merge of the owner's local partial (own chunk, causal) plus
+# each peer's remote partial (its chunk snapshot, non-causal) via one RPC
+# hop per peer.  Semantics stay exactly memory-split; latency is L x (P-1)
+# RTT per token (experiment-phase evidence for CXL-class interconnect).
+# ---------------------------------------------------------------------------
+DECODE_RING_MAP: dict[int, dict] = {}
+# The connector registers its staging-release callback here so the backend
+# can free a request's staged prefix KV (refcount-aware) at decode start.
+_STAGING_RELEASE_FN = None
+
+
+def _decode_ring_enabled() -> bool:
+    return os.environ.get("HCP_RING_DECODE_RING", "0") == "1"
+
+
+def set_staging_release_fn(fn) -> None:
+    global _STAGING_RELEASE_FN
+    _STAGING_RELEASE_FN = fn
+
+
+def register_decode_ring(
+    first_block_id: int, peer_chunks: list[tuple[str, str]], prefix_len: int
+) -> None:
+    """peer_chunks: ordered (chunk_key, peer_url) pairs of the prefix."""
+    DECODE_RING_MAP[first_block_id] = {
+        "peer_chunks": [(ck, u) for ck, u in peer_chunks if u],
+        "prefix_len": prefix_len,
+    }
+
+
+def clear_decode_ring(first_block_id: int) -> None:
+    DECODE_RING_MAP.pop(first_block_id, None)
+
+
+def _release_staged_for_request(first_block_id: int) -> None:
+    """Decode-ring transition: free this request's transiently staged prefix
+    KV via the connector's refcount-aware callback (falls back to a direct
+    idempotent drop when no callback is registered)."""
+    if first_block_id not in PEER_REQ_MAP:
+        return
+    if _STAGING_RELEASE_FN is not None:
+        _STAGING_RELEASE_FN(first_block_id)
+    else:
+        ck_list = PEER_REQ_MAP.pop(first_block_id, None) or []
+        for ck in ck_list:
+            drop_chunk_kv(ck)
+
+
 # High-water marks for validation: staging is freed when a request finishes,
 # so post-run checks cannot inspect live staging — use these counters instead.
 STAGING_STATS: dict = {
@@ -482,6 +536,38 @@ class HcpRingAttentionImpl(AttentionImpl):
             q_r = query[qs:qe]
             qpos0 = tk - tq  # global position of this request's first query
 
+            # Memory-split decode (accumulator ring): decode steps only.
+            # The staged prefix KV is released at the transition; attention =
+            # local partial (own chunk + decode growth, causal) merged with
+            # each peer's remote partial (its chunk snapshot, non-causal).
+            dr = None
+            if _decode_ring_enabled() and tq == 1:
+                dr = DECODE_RING_MAP.get(int(block_table[r, 0]))
+            if dr is not None:
+                _release_staged_for_request(int(block_table[r, 0]))
+                plen = dr["prefix_len"]
+                o_acc, lse_acc = _attn(
+                    q_r,
+                    k_all[plen:],
+                    v_all[plen:],
+                    self.scale,
+                    qpos0 - plen,
+                    self.sliding_window,
+                )
+                from hcp_vllm_plugin.ring_decode import merge_remote_partial
+
+                for ck, peer_url in dr["peer_chunks"]:
+                    o_acc, lse_acc = merge_remote_partial(
+                        peer_url,
+                        ck,
+                        layer.layer_name,
+                        q_r,
+                        o_acc,
+                        lse_acc,
+                        self.scale,
+                    )
+                output[qs:qe] = o_acc.to(output.dtype)
+                continue
             # Determine the peer (prefix) KV for THIS request.  Lookup is
             # per-row: the request's first block id identifies its ORDERED
             # staged prefix chunks (registered by the KV connector).  The
