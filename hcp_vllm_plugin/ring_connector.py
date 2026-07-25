@@ -17,19 +17,33 @@ which is deliberately DIFFERENT from the stock disaggregated-prefill semantics
     attention (online-softmax merge) and that can be discarded after use.
 
 Roles (``kv_connector_extra_config``):
-  - ``ring_role``: "producer" | "consumer" | "relay"
+  - ``ring_role``: "ring" | "producer" | "consumer" | "relay"
+      ring    : the UNIFIED role of a true ring node.  Every node consumes
+                its ordered prefix chunks (empty for position 0) and produces
+                its own chunk, i.e. ring = consumer-side + producer-side in
+                one instance.  "relay" is kept as a backward-compatible alias
+                of the same semantics; "producer" is the degenerate case with
+                no prefix; "consumer" is the degenerate case with no
+                downstream.  A staged chunk is re-served (its _READY marker
+                is written locally right after staging), so the ring
+                transport is NEIGHBOR accumulate-forward: a node pulls its
+                whole accumulated prefix from its physical predecessor
+                (i-1+N)%N only, and its successor pulls from it in turn —
+                producer N's consumer is literally (N+1)%N.
       producer: prompt is its own chunk; computes it, saves per-layer K/V to
                 its store and serves the store over HTTP (worker side only).
       consumer: prompt is the FULL sequence; the prefix (earlier chunk) is
                 marked external so only the suffix is computed; peer KV is
                 fetched from the producer into the ring backend's staging.
-      relay   : consumer + producer in one instance (N>2 ring middle node):
-                the prompt is prefix + own chunk; the prefix is marked
-                external (fetched transiently like a consumer) AND the own
-                chunk's computed KV is saved to its store / served over HTTP
-                (like a producer).  The ready state cascades: a relay's
-                _READY marker is written only after its forward completes,
-                which in turn required its own prefix chunks to be staged.
+      relay   : legacy alias of "ring" (kept for existing drivers).
+
+Ring-order shorthand (single-request deployments):
+  - ``ring_order``      : comma-separated ``chunk@url`` specs in ring order,
+                          e.g. "c0@http://a:8901,c1@http://b:8901,c2@http://c:8901"
+  - ``ring_my_chunk``   : this node's own chunk id within ``ring_order``
+  When set and a request carries no per-request hcp_ring params, the prefix
+  chunk list derives from the order (all chunks before mine) and the peer
+  url defaults to my physical predecessor (neighbor accumulate-forward).
 
 Config keys (``kv_connector_extra_config``):
   - ``ring_role``             : "producer" | "consumer" | "relay"
@@ -125,11 +139,15 @@ def _as_str_list(value: Any) -> list[str]:
     return [str(s) for s in value]
 
 
-def _chunks_and_urls(rp: dict[str, Any], global_ids: list[str]) -> tuple[list[str], list[str]]:
+def _chunks_and_urls(
+    rp: dict[str, Any], global_ids: list[str], global_urls: list[str] | None = None
+) -> tuple[list[str], list[str]]:
     """Ordered prefix chunk keys + per-chunk peer urls ("" = global fallback).
 
     Plural ``chunk_ids`` / ``peer_urls`` win; the singular ``chunk_id`` /
     ``peer_url`` forms are treated as one-element lists (backward compat).
+    Without any per-request values, the global ids/urls (ring_order-derived)
+    are used.
     """
     ids = _as_str_list(rp.get("chunk_ids"))
     if not ids and rp.get("chunk_id"):
@@ -139,6 +157,8 @@ def _chunks_and_urls(rp: dict[str, Any], global_ids: list[str]) -> tuple[list[st
     urls = _as_str_list(rp.get("peer_urls"))
     if not urls and rp.get("peer_url"):
         urls = [str(rp["peer_url"])]
+    if not urls and global_urls:
+        urls = list(global_urls)
     urls = [u.rstrip("/") for u in urls]
     urls += [""] * (len(ids) - len(urls))
     return ids, urls
@@ -189,11 +209,14 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         cfg = self._kv_transfer_config
         self._block_size = vllm_config.cache_config.block_size
         self._ring_role = cfg.get_from_extra_config("ring_role", "producer")
-        if self._ring_role not in ("producer", "consumer", "relay"):
+        if self._ring_role not in ("ring", "producer", "consumer", "relay"):
             raise ValueError(
                 f"HcpRingKvConnector: unknown ring_role {self._ring_role!r} "
-                "(expected producer|consumer|relay)"
+                "(expected ring|producer|consumer|relay)"
             )
+        # Side flags: "ring"/"relay" are both consumer-side and producer-side.
+        self._consumer_side = self._ring_role in ("consumer", "relay", "ring")
+        self._producer_side = self._ring_role in ("producer", "relay", "ring")
         self._shared_path = cfg.get_from_extra_config(
             "ring_shared_path", "/tmp/hcp_ring_kv"
         )
@@ -207,6 +230,25 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         )
         self._peer_url = cfg.get_from_extra_config("ring_peer_url", "").rstrip("/")
         self._serve_port = int(cfg.get_from_extra_config("ring_serve_port", 0))
+        # Ring-order shorthand: derive my prefix chunks and my physical
+        # predecessor (neighbor accumulate-forward) from "c0@url,c1@url,...".
+        # Per-request hcp_ring params always take precedence over this.
+        self._prefix_peer_urls: list[str] = []
+        order = cfg.get_from_extra_config("ring_order", "")
+        my_chunk = cfg.get_from_extra_config("ring_my_chunk", self._chunk_id)
+        if order:
+            specs = [s for s in order.split(",") if s]
+            ids = [s.split("@")[0] for s in specs]
+            urls = [
+                (s.split("@", 1)[1].rstrip("/") if "@" in s else "")
+                for s in specs
+            ]
+            if my_chunk in ids:
+                i = ids.index(my_chunk)
+                self._chunk_id = my_chunk
+                self._prefix_chunk_ids = ids[:i]
+                pred = urls[i - 1] if i > 0 else ""
+                self._prefix_peer_urls = [pred] * i
 
         self._requests_need_load: dict[str, "Request"] = {}
         self._saved_tokens: dict[str, int] = {}
@@ -218,10 +260,10 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         self._chunk_refs: dict[str, int] = {}
         self._chunk_lens: dict[str, int] = {}
         os.makedirs(self._run_dir(), exist_ok=True)
-        # Producer/relay WORKER-side connectors hold/serve KV; the
-        # scheduler-side instance must not bind the HTTP port.
+        # Producer-side WORKER connectors hold/serve KV; the scheduler-side
+        # instance must not bind the HTTP port.
         if (
-            self._ring_role in ("producer", "relay")
+            self._producer_side
             and self._serve_port > 0
             and self._role == KVConnectorRole.WORKER
         ):
@@ -304,7 +346,7 @@ class HcpRingKvConnector(KVConnectorBase_V1):
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
-        if self._ring_role not in ("consumer", "relay"):
+        if not self._consumer_side:
             return 0, False
 
         # Per-request params (kv_transfer_params.hcp_ring) override globals,
@@ -317,7 +359,9 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         prefix_len = int(rp["prefix_len"]) if "prefix_len" in rp else self._prefix_len
         if prefix_len == 0:
             return 0, False
-        chunk_ids, peer_urls = _chunks_and_urls(rp, self._prefix_chunk_ids)
+        chunk_ids, peer_urls = _chunks_and_urls(
+            rp, self._prefix_chunk_ids, self._prefix_peer_urls
+        )
         if not chunk_ids:
             return 0, False
 
@@ -355,9 +399,11 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         for new_req in scheduler_output.scheduled_new_reqs:
             rp = _ring_params_from_sampling(new_req.sampling_params)
             if new_req.req_id in self._requests_need_load:
-                # Consumer/relay: stage the prefix chunks' KV (no pool slot
+                # Consumer side: stage the prefix chunks' KV (no pool slot
                 # mapping — we deliberately do NOT load into the block table).
-                chunk_ids, peer_urls = _chunks_and_urls(rp, self._prefix_chunk_ids)
+                chunk_ids, peer_urls = _chunks_and_urls(
+                    rp, self._prefix_chunk_ids, self._prefix_peer_urls
+                )
                 meta.requests.append(
                     RingReqMeta(
                         is_store=False,
@@ -369,15 +415,16 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                         prefix_len=int(rp["prefix_len"]) if "prefix_len" in rp else self._prefix_len,
                     )
                 )
-            if self._ring_role in ("producer", "relay"):
-                # Producer/relay: save this instance's own chunk KV after
-                # compute.  On a relay the own chunk is the request's suffix:
-                # the external prefix is skipped in the slot mapping.
+            if self._producer_side:
+                # Producer side: save this instance's own chunk KV after
+                # compute.  On a ring/relay node the own chunk is the
+                # request's suffix: the external prefix is skipped in the
+                # slot mapping.
                 token_ids = new_req.prompt_token_ids or []
                 block_ids = list(new_req.block_ids[0])
                 chunk_key = rp.get("chunk_id") or self._chunk_id
                 skip = 0
-                if self._ring_role == "relay":
+                if self._consumer_side:
                     plen = int(rp["prefix_len"]) if "prefix_len" in rp else self._prefix_len
                     skip = _align_down(plen, self._block_size)
                 slot_mapping = self._make_slot_mapping(token_ids, block_ids, skip)
@@ -469,6 +516,19 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                     total_bytes / 2**20,
                     peer_url or self._peer_url or "local store",
                 )
+                # Re-serve (neighbor accumulate-forward): mark the staged
+                # chunk ready in THIS node's store so its ring successor can
+                # pull the accumulated prefix from here alone.
+                with open(self._ready_marker(chunk_key), "w") as f:
+                    json.dump(
+                        {
+                            "tokens": k.shape[0],
+                            "layers": staged,
+                            "ts": time.time(),
+                            "re_served": True,
+                        },
+                        f,
+                    )
             if staged_total != expected_total:
                 raise RuntimeError(
                     f"HcpRingKvConnector: staged prefix length {staged_total} "
