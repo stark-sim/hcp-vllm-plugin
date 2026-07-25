@@ -253,6 +253,17 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         self._requests_need_load: dict[str, "Request"] = {}
         self._saved_tokens: dict[str, int] = {}
         self._saved_layers: dict[str, int] = {}
+        # Readiness poll hygiene: a chunk that reported _READY stays ready
+        # forever (cache hits skip polling entirely); a failed check is
+        # backed off per chunk.  Without this, a scheduler spinning on
+        # stalled requests fires thousands of HEAD requests per second at
+        # the peer and exhausts ephemeral ports (observed: 6M polls, then
+        # urlopen failures -> permanent livelock).
+        self._ready_ok: set[str] = set()
+        self._ready_next_poll: dict[str, float] = {}
+        self._ready_poll_interval = float(
+            cfg.get_from_extra_config("ring_ready_poll_interval_s", 0.5)
+        )
         # Worker-side live-request bookkeeping for cleanup:
         #   req_id -> (first_block_id, [chunk_keys]); chunk_key -> refcount;
         #   chunk_key -> staged token count (per layer)
@@ -380,10 +391,22 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         return external, False
 
     def _prefix_ready(self, chunk_key: str, peer_url: str = "") -> bool:
+        cache_key = f"{peer_url or self._peer_url}/{self._run_id}/{chunk_key}"
+        if cache_key in self._ready_ok:
+            return True
+        now = time.monotonic()
+        if now < self._ready_next_poll.get(cache_key, 0.0):
+            return False
         if peer_url or self._peer_url:
             rel = os.path.join(self._run_id, chunk_key, "_READY")
-            return self._remote_exists(rel, peer_url)
-        return os.path.exists(self._ready_marker(chunk_key))
+            ok = self._remote_exists(rel, peer_url)
+        else:
+            ok = os.path.exists(self._ready_marker(chunk_key))
+        if ok:
+            self._ready_ok.add(cache_key)
+        else:
+            self._ready_next_poll[cache_key] = now + self._ready_poll_interval
+        return ok
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

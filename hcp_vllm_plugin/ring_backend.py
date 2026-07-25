@@ -489,13 +489,19 @@ class HcpRingAttentionImpl(AttentionImpl):
             # concatenated into one contiguous peer KV segment and consumed
             # with a single non-causal peer pass (linear copy, mathematically
             # equivalent to N-1 separate passes).  PoC convenience: with no
-            # mapping and exactly ONE staged chunk (single-request,
-            # no-connector runs such as validate_ring_backend customst),
+            # mapping, a SINGLE-request batch, and exactly ONE staged chunk
+            # (no-connector runs such as validate_ring_backend customst),
             # use that chunk.
             staged = None
             if _ring_enabled():
                 ck_list = PEER_REQ_MAP.get(int(block_table[r, 0]))
-                if ck_list is None:
+                if ck_list is None and len(seq_lens) == 1:
+                    # Single-request fallback ONLY (no-connector runs such as
+                    # validate_ring_backend customst).  In a multi-request
+                    # batch an unmapped request must NOT adopt another
+                    # request's staged chunk — the fallback would bind the
+                    # wrong peer KV (and trip the WRITE_TRACK peer-region
+                    # check on the request's own slots).
                     chunks = {key[0] for key in PEER_KV_STAGING}
                     if len(chunks) == 1:
                         ck_list = [next(iter(chunks))]
