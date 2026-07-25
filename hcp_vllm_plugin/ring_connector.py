@@ -293,8 +293,13 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         ):
             self._start_http_server()
         # Decode-ring: let the backend release staged prefix KV (refcount
-        # aware) when a request enters the decode phase.
-        set_staging_release_fn(self._release_request_staging)
+        # aware) when a request enters the decode phase.  Only the WORKER-side
+        # instance owns _live (start_load_kv); EngineCore builds the model
+        # executor BEFORE the scheduler, so the scheduler-side instance is
+        # constructed last and must not overwrite the callback with its own
+        # (its _live is always empty -> release would be a silent no-op).
+        if self._role == KVConnectorRole.WORKER:
+            set_staging_release_fn(self._release_request_staging)
         logger.info(
             "HcpRingKvConnector init: role=%s chunk=%s prefix=%s(%d) path=%s "
             "peer=%s serve=%d",
