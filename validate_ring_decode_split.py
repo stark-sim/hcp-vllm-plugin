@@ -19,8 +19,11 @@ Checks (consumer mode):
   2. MEMORY-SPLIT DECODE: PEER_KV_STAGING / PEER_REQ_MAP are EMPTY right
      after generate returns (BEFORE the cleanup-flush request), proving the
      prefix KV was released at decode start, not at request finish.
-  3. A/B partial services really served the accumulator hops (call counts).
-  4. slots_written accounting on C (own chunk + decode only).
+  3. A/B partial services really served the accumulator hops (call counts)
+     and received their growth shares (rotation printed for comparison).
+  4. slots_written accounting on C: own chunk ONLY (+ flush request) —
+     decode growth is NOT written to the owner's pool; it is sharded
+     across the ring (default round-robin by global position).
 
 Modes: producer | relay | consumer | all (orchestrates all three).
 
@@ -130,7 +133,25 @@ def mode_producer(args) -> None:
     t0 = time.time()
     while time.time() - t0 < args.hold_secs and not os.path.exists(args.done_file):
         time.sleep(2)
+    _print_partial_stats()
     print("[A/producer] exiting", flush=True)
+
+
+def _print_partial_stats() -> None:
+    """Growth/merge counters of this node's partial service (plugin logger
+    does not reach captured logs; print() does)."""
+    try:
+        from hcp_vllm_plugin.ring_decode import SERVICES
+
+        for svc in SERVICES:
+            print(
+                f"PartialAttentionService final: calls={svc.calls} "
+                f"growth_appends={svc.growth_appends} "
+                f"growth_tokens_per_layer={svc.growth_tokens()}",
+                flush=True,
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"PartialAttentionService stats unavailable: {e}", flush=True)
 
 
 def mode_relay(args) -> None:
@@ -164,6 +185,7 @@ def mode_relay(args) -> None:
     t0 = time.time()
     while time.time() - t0 < args.hold_secs and not os.path.exists(args.done_file):
         time.sleep(2)
+    _print_partial_stats()
     print("[B/relay] exiting", flush=True)
 
 
@@ -262,9 +284,28 @@ def mode_consumer(args) -> None:
     argmax_diff = (ref_logits - cons_logits).abs()[ref_logits.argmax()].item()
 
     n_written = len(rb.WRITE_TRACK["slots"])
-    # Own-chunk accounting: c2 + decode growth + flush (aligned).
-    expected_slots = s2 + args.decode + 64
+    # Sharded-growth accounting: decode tokens are NOT written to the owner's
+    # pool (owned growth lives in the backend's compact buffer, the rest is
+    # shipped).  Pool writes = own chunk c2 + the 33-slot flush request
+    # (+block-alignment slack).  The legacy all-growth-in-pool behavior
+    # would add args.decode more slots and exceed this bound.
+    expected_slots = s2 + 40
     slots_ok = n_written <= expected_slots
+    # Expected growth rotation (ring order [A, B, owner]).  KV is produced
+    # only for the first --decode-1 generated positions (the last sampled
+    # token never re-enters the engine), and the last produced token is
+    # stashed but never shipped (no subsequent step exists).
+    first_pos = args.total
+    positions = list(range(first_pos, first_pos + args.decode - 1))
+    shipped = positions[:-1]
+    exp = {
+        "A": sum(1 for p in shipped if p % 3 == 0),
+        "B": sum(1 for p in shipped if p % 3 == 1),
+        "owner": sum(1 for p in positions if p % 3 == 2),
+    }
+    print(f"[decode-split] expected growth rotation (rr): {exp} "
+          f"(A/B served via partial services; owner via backend buffer)",
+          flush=True)
     decode_split_ok = staging_left == 0 and map_left == 0
     ring_clean_ok = ring_map_after == 0
     impl_ok = (

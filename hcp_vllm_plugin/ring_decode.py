@@ -1,17 +1,24 @@
 """Memory-split decode for the HCP ring: accumulator-ring distributed attention.
 
-Design (decision-memory-split-decode-20260725): decode must preserve the same
+Design (decision-memory-split-decode-20260725, extended by
+decision-decode-growth-shard-20260725): decode must preserve the same
 memory-splitting semantics as prefill — NO node may hold the full KV, not
-even transiently.  The owner of the tail chunk drives the decode loop; per
-decode step, per layer:
+even transiently, and that includes the DECODE GROWTH: each newly generated
+token's KV is assigned to a ring node (default policy: global position
+round-robin, p mod N; HCP_RING_DECODE_GROWTH=owner keeps the legacy
+all-on-owner behavior for comparison).  The owner of the tail chunk drives
+the decode loop; per decode step, per layer:
 
   1. the owner computes the new token's Q and the LOCAL partial attention
-     over its own chunk + decode growth (causal) -> accumulator (o, lse);
+     over its own chunk + its owned growth share + the current token
+     (causal) -> accumulator (o, lse);
   2. the accumulator + Q travel along the ring (one RPC hop per peer);
      each peer computes the partial attention of Q against ITS OWN chunk
-     snapshot (non-causal) and folds it into the accumulator with the
-     online-softmax merge;
-  3. after the last peer the accumulator is the globally exact attention
+     snapshot + its growth share (non-causal) and folds it into the
+     accumulator with the online-softmax merge;
+  3. growth KV owed to a peer is piggybacked on the NEXT step's RPC to that
+     peer (append-then-serve keeps the ordering with zero extra hops);
+  4. after the last peer the accumulator is the globally exact attention
      output.  Hop cost is L x (P-1) RTT per token — slow by design in the
      experiment phase (direct evidence for the CXL-class interconnect
      requirement).
@@ -19,14 +26,16 @@ decode step, per layer:
 This module contains both sides:
   * PartialAttentionService — runs on EVERY ring node: loads this node's own
     chunk KV snapshot from its connector store (safetensors written during
-    prefill) into GPU once, then serves POST /partial_attn requests that
-    merge a remote accumulator with the local chunk's partial attention.
+    prefill) into GPU once, keeps an in-memory growth buffer for the decode
+    tokens assigned to this node, then serves POST /partial_attn requests
+    that merge a remote accumulator with the local partial attention.
   * merge_remote_partial — the owner-side client: one RPC hop of the
-    accumulator ring.
+    accumulator ring (optionally carrying one growth token's KV for append).
 
 Transport payload is safetensors over HTTP (consistent with the KV store);
-messages are KB-sized (Q + accumulator), so latency is dominated by pure
-link RTT — exactly the quantity the experiment wants to expose.
+messages are KB-sized (Q + accumulator + at most one token of growth KV), so
+latency is dominated by pure link RTT — exactly the quantity the experiment
+wants to expose.
 """
 
 from __future__ import annotations
@@ -43,6 +52,26 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 PARTIAL_PATH = "/partial_attn"
+
+# Live services in this process (validation inspects growth stats here; the
+# plugin logger does not reliably reach captured driver logs).
+SERVICES: list["PartialAttentionService"] = []
+
+
+def growth_assignee(pos: int, ring_size: int, policy: str = "rr") -> int:
+    """Which ring node durably holds the KV of the decode token at global
+    position `pos`.  Nodes are indexed in ring order: 0..N-2 are the owner's
+    prefix peers (in peer_chunks order), N-1 is the owner itself.
+
+    Policies (the planning-layer seam for future alternatives):
+      * "rr"    — round-robin by global position, p mod N (default): growth
+                  memory pressure splits evenly across the ring.
+      * "owner" — everything stays on the owner (legacy owner-collapse;
+                  kept for A/B comparison of locality vs. split).
+    """
+    if policy == "owner":
+        return ring_size - 1
+    return pos % ring_size
 
 
 def _merge_pair(
@@ -83,9 +112,15 @@ class PartialAttentionService:
         self._dtype = dtype
         # (chunk_key, layer_name) -> (k, v)
         self._layers: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
+        # layer_name -> (k, v): decode-growth tokens assigned to THIS node,
+        # appended via /partial_attn piggyback (durable for the decode phase;
+        # PoC scope: one decode-ring request per service lifetime).
+        self._growth: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._growth_appends = 0
         self._ready = threading.Event()
         self._calls = 0
         self._store_dir = store_dir
+        SERVICES.append(self)
         threading.Thread(target=self._load, daemon=True).start()
 
     def _load(self) -> None:
@@ -127,11 +162,22 @@ class PartialAttentionService:
     def calls(self) -> int:
         return self._calls
 
+    @property
+    def growth_appends(self) -> int:
+        return self._growth_appends
+
+    def growth_tokens(self) -> int:
+        """Decode-growth tokens held per layer (0 when no growth arrived)."""
+        if not self._growth:
+            return 0
+        return next(iter(self._growth.values()))[0].shape[0]
+
     def is_ready(self) -> bool:
         return self._ready.is_set()
 
     def handle(self, payload: bytes) -> bytes:
-        """Merge a remote accumulator with this chunk's partial attention."""
+        """Append any piggybacked growth KV, then merge a remote accumulator
+        with this node's partial (chunk snapshot + growth share)."""
         tensors = safetensors.torch.load(payload)
         chunk = bytes(tensors["chunk"].tolist()).decode()
         layer = bytes(tensors["layer"].tolist()).decode()
@@ -139,7 +185,20 @@ class PartialAttentionService:
         o_acc = tensors["o"].to(self._device, self._dtype)
         lse_acc = tensors["lse"].to(self._device, torch.float32)
         scale = float(tensors["scale"].item())
+        if "growth_k" in tensors:
+            gk = tensors["growth_k"].to(self._device, self._dtype)
+            gv = tensors["growth_v"].to(self._device, self._dtype)
+            prev = self._growth.get(layer)
+            self._growth[layer] = (
+                gk if prev is None else torch.cat([prev[0], gk], dim=0),
+                gv if prev is None else torch.cat([prev[1], gv], dim=0),
+            )
+            self._growth_appends += 1
         k, v = self._layers[(chunk, layer)]
+        g = self._growth.get(layer)
+        if g is not None:
+            k = torch.cat([k, g[0]], dim=0)
+            v = torch.cat([v, g[1]], dim=0)
         from hcp_vllm_plugin.ring_triton_attn import ring_attn_with_lse
 
         o_loc, lse_loc = ring_attn_with_lse(q.contiguous(), k, v, scale, None)
@@ -192,21 +251,28 @@ def merge_remote_partial(
     o: torch.Tensor,
     lse: torch.Tensor,
     scale: float,
+    growth_k: torch.Tensor | None = None,
+    growth_v: torch.Tensor | None = None,
     timeout_s: float = 600,
     retries: int = 5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One accumulator-ring hop: ask `peer_url` to fold its chunk's partial
-    attention of q into the (o, lse) accumulator; returns the merged pair."""
-    payload = safetensors.torch.save(
-        {
-            "chunk": torch.tensor(list(chunk.encode()), dtype=torch.uint8),
-            "layer": torch.tensor(list(layer.encode()), dtype=torch.uint8),
-            "q": q.detach().contiguous().cpu(),
-            "o": o.detach().contiguous().cpu(),
-            "lse": lse.detach().contiguous().cpu(),
-            "scale": torch.tensor([scale], dtype=torch.float32),
-        }
-    )
+    attention of q into the (o, lse) accumulator; returns the merged pair.
+    When growth_k/growth_v are given, the peer durably appends that decode
+    token's KV to its growth buffer BEFORE serving (append-then-serve: the
+    piggyback keeps the ordering with zero extra hops)."""
+    payload_dict = {
+        "chunk": torch.tensor(list(chunk.encode()), dtype=torch.uint8),
+        "layer": torch.tensor(list(layer.encode()), dtype=torch.uint8),
+        "q": q.detach().contiguous().cpu(),
+        "o": o.detach().contiguous().cpu(),
+        "lse": lse.detach().contiguous().cpu(),
+        "scale": torch.tensor([scale], dtype=torch.float32),
+    }
+    if growth_k is not None and growth_v is not None:
+        payload_dict["growth_k"] = growth_k.detach().contiguous().cpu()
+        payload_dict["growth_v"] = growth_v.detach().contiguous().cpu()
+    payload = safetensors.torch.save(payload_dict)
     req = urllib.request.Request(
         peer_url.rstrip("/") + PARTIAL_PATH,
         data=payload,

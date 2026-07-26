@@ -140,12 +140,15 @@ def clear_peer_kv() -> None:
 # Memory-split decode (accumulator ring).  When HCP_RING_DECODE_RING=1, a
 # request that has registered decode-ring info (its prefix chunks' peer
 # endpoints + prefix length) switches at decode time: its transiently staged
-# prefix KV is DROPPED (the owner keeps only its own chunk + decode growth),
-# and each decode step's attention is computed as the online-softmax
-# accumulator merge of the owner's local partial (own chunk, causal) plus
-# each peer's remote partial (its chunk snapshot, non-causal) via one RPC
-# hop per peer.  Semantics stay exactly memory-split; latency is L x (P-1)
-# RTT per token (experiment-phase evidence for CXL-class interconnect).
+# prefix KV is DROPPED, and each decode step's attention is computed as the
+# online-softmax accumulator merge of the owner's local partial (own chunk +
+# owned growth share + current token, causal) plus each peer's remote
+# partial (its chunk snapshot + its growth share, non-causal) via one RPC
+# hop per peer.  Decode GROWTH is itself sharded across the ring (default:
+# global position round-robin; HCP_RING_DECODE_GROWTH selects the policy) —
+# every node durably holds only its own share of ALL KV, prefill and decode
+# alike.  Semantics stay exactly memory-split; latency is L x (P-1) RTT per
+# token (experiment-phase evidence for CXL-class interconnect).
 # ---------------------------------------------------------------------------
 DECODE_RING_MAP: dict[int, dict] = {}
 # The connector registers its staging-release callback here so the backend
@@ -157,6 +160,10 @@ def _decode_ring_enabled() -> bool:
     return os.environ.get("HCP_RING_DECODE_RING", "0") == "1"
 
 
+def _growth_policy() -> str:
+    return os.environ.get("HCP_RING_DECODE_GROWTH", "rr")
+
+
 def set_staging_release_fn(fn) -> None:
     global _STAGING_RELEASE_FN
     _STAGING_RELEASE_FN = fn
@@ -166,9 +173,22 @@ def register_decode_ring(
     first_block_id: int, peer_chunks: list[tuple[str, str]], prefix_len: int
 ) -> None:
     """peer_chunks: ordered (chunk_key, peer_url) pairs of the prefix."""
+    peers = [(ck, u) for ck, u in peer_chunks if u]
     DECODE_RING_MAP[first_block_id] = {
-        "peer_chunks": [(ck, u) for ck, u in peer_chunks if u],
+        "peer_chunks": peers,
         "prefix_len": prefix_len,
+        # Ring indexing for growth assignment: 0..N-2 = peers in prefix
+        # order, N-1 = the owner itself.
+        "ring_size": len(peers) + 1,
+        "own_index": len(peers),
+        # Filled lazily at the first decode step (tk = prompt_len + 1 there).
+        "own_chunk_len": None,
+        # layer_name -> (k, v): decode tokens assigned to the owner.
+        "growth": {},
+        # layer_name -> (assignee, k, v): this step's token, shipped on the
+        # next step's RPC to its assignee (one-step pipeline lag).
+        "pending_growth": {},
+        "growth_policy": _growth_policy(),
     }
 
 
@@ -472,9 +492,17 @@ class HcpRingAttentionImpl(AttentionImpl):
     ) -> None:
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return
+        n = slot_mapping.shape[0]
+        # Memory-split decode with sharded growth: a decode-ring decode step
+        # (single-token write while a decode-ring registration is live) does
+        # NOT write the pool — the token's KV is routed by the growth
+        # assignment policy (owner's compact buffer, or shipped to its
+        # assignee).  The pool therefore durably holds only the owner's own
+        # chunk.  PoC scope: decode-ring runs are single-request.
+        if n == 1 and _decode_ring_enabled() and DECODE_RING_MAP:
+            return
         key_cache, value_cache = kv_cache.unbind(1)
         block_size = key_cache.shape[1]
-        n = slot_mapping.shape[0]
         block_idx = torch.div(slot_mapping, block_size, rounding_mode="floor")
         block_off = slot_mapping % block_size
         key_cache[block_idx, block_off] = key[:n]
@@ -538,33 +566,79 @@ class HcpRingAttentionImpl(AttentionImpl):
 
             # Memory-split decode (accumulator ring): decode steps only.
             # The staged prefix KV is released at the transition; attention =
-            # local partial (own chunk + decode growth, causal) merged with
-            # each peer's remote partial (its chunk snapshot, non-causal).
+            # local partial (own chunk + owned growth share + current token,
+            # causal) merged with each peer's remote partial (its chunk
+            # snapshot + its growth share, non-causal).  Decode growth is
+            # sharded across the ring by the assignment policy: owned tokens
+            # go to a compact per-layer buffer, the rest are piggybacked on
+            # the NEXT step's RPC to their assignee (one-step pipeline lag;
+            # the current token always participates locally this step).
             dr = None
             if _decode_ring_enabled() and tq == 1:
                 dr = DECODE_RING_MAP.get(int(block_table[r, 0]))
             if dr is not None:
                 _release_staged_for_request(int(block_table[r, 0]))
                 plen = dr["prefix_len"]
+                if dr["own_chunk_len"] is None:
+                    # First decode step: tk = prompt_len + 1 (current token).
+                    dr["own_chunk_len"] = tk - 1 - plen
+                own_len = dr["own_chunk_len"]
+                layer_name = layer.layer_name
+                pos = tk - 1  # global position of the current (query) token
+
+                from hcp_vllm_plugin.ring_decode import (
+                    growth_assignee,
+                    merge_remote_partial,
+                )
+
+                assignee = growth_assignee(
+                    pos, dr["ring_size"], dr["growth_policy"]
+                )
+                # Last step's token for THIS layer rides this step's RPC to
+                # its assignee (append-then-serve keeps the ordering).
+                ship = dr["pending_growth"].pop(layer_name, None)
+
+                # Current token K/V (post-RoPE), [1, HKV, D].
+                k_cur = key[qs:qe].contiguous()
+                v_cur = value[qs:qe].contiguous()
+                # Local segment: own chunk (pool) + owned growth + current.
+                k_loc = k_all[plen : plen + own_len]
+                v_loc = v_all[plen : plen + own_len]
+                g = dr["growth"].get(layer_name)
+                if g is not None:
+                    k_loc = torch.cat([k_loc, g[0]], dim=0)
+                    v_loc = torch.cat([v_loc, g[1]], dim=0)
+                k_loc = torch.cat([k_loc, k_cur], dim=0)
+                v_loc = torch.cat([v_loc, v_cur], dim=0)
                 o_acc, lse_acc = _attn(
                     q_r,
-                    k_all[plen:],
-                    v_all[plen:],
+                    k_loc,
+                    v_loc,
                     self.scale,
-                    qpos0 - plen,
+                    k_loc.shape[0] - 1,
                     self.sliding_window,
                 )
-                from hcp_vllm_plugin.ring_decode import merge_remote_partial
-
-                for ck, peer_url in dr["peer_chunks"]:
+                if assignee == dr["own_index"]:
+                    dr["growth"][layer_name] = (
+                        k_cur if g is None else torch.cat([g[0], k_cur], 0),
+                        v_cur if g is None else torch.cat([g[1], v_cur], 0),
+                    )
+                else:
+                    dr["pending_growth"][layer_name] = (assignee, k_cur, v_cur)
+                for idx, (ck, peer_url) in enumerate(dr["peer_chunks"]):
+                    gk = gv = None
+                    if ship is not None and ship[0] == idx:
+                        gk, gv = ship[1], ship[2]
                     o_acc, lse_acc = merge_remote_partial(
                         peer_url,
                         ck,
-                        layer.layer_name,
+                        layer_name,
                         q_r,
                         o_acc,
                         lse_acc,
                         self.scale,
+                        growth_k=gk,
+                        growth_v=gv,
                     )
                 output[qs:qe] = o_acc.to(output.dtype)
                 continue
