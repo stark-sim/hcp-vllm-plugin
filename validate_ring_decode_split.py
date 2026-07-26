@@ -314,14 +314,24 @@ def mode_consumer(args) -> None:
     print(f"[impl] attn triton/torch: {rb.IMPL_STATS['attn_triton']}/"
           f"{rb.IMPL_STATS['attn_torch']}, merge triton/torch: "
           f"{rb.IMPL_STATS['merge_triton']}/{rb.IMPL_STATS['merge_torch']}")
+    # Crisp pool-skip evidence: every decode step × every layer must SKIP
+    # its single-token pool write while the decode-ring registration is
+    # live (slot-id counts alone cannot prove this — freed slots are
+    # recycled by the flush request and collapse in the set).
+    expected_skips = (args.decode - 1) * NUM_LAYERS
+    skip_count = rb.WRITE_TRACK.get("skipped", 0)
+    skip_ok = skip_count == expected_skips
     print(f"[decode-split] consumer wrote {n_written} pool slots "
-          f"(expected <= {expected_slots} = c2 + decode + slack): "
+          f"(expected <= {expected_slots} = c2 + flush + slack): "
           f"{'OK' if slots_ok else 'VIOLATED'}")
+    print(f"[decode-split] decode pool writes skipped: {skip_count} "
+          f"(expected {expected_skips} = (decode-1) x {NUM_LAYERS} layers): "
+          f"{'OK' if skip_ok else 'VIOLATED'}")
     print(f"[decode-split] decode-ring map cleared after finish: "
           f"{ring_map_after == 0}")
 
     ok = (token_match and max_diff < 0.1 and decode_split_ok
-          and ring_clean_ok and slots_ok and impl_ok)
+          and ring_clean_ok and slots_ok and skip_ok and impl_ok)
     print("--- result ---")
     print(f"  tokens match        : {token_match} (ref={ref_tokens} "
           f"cons={cons_tokens})")
@@ -329,6 +339,7 @@ def mode_consumer(args) -> None:
           f"{argmax_diff:.6f})")
     print(f"  memsplit decode     : {'OK' if decode_split_ok else 'VIOLATED'}")
     print(f"  slots accounting    : {'OK' if slots_ok else 'VIOLATED'}")
+    print(f"  pool-skip evidence  : {'OK' if skip_ok else 'VIOLATED'}")
     print(f"  triton kernel path  : {'OK' if impl_ok else 'NOT USED'}")
     print(f"  verdict: {'PASS' if ok else 'FAIL'}", flush=True)
     sys.exit(0 if ok else 1)

@@ -242,13 +242,14 @@ def _note_staging_locked(chunk_key: str, k: torch.Tensor) -> None:
 # that no slot belonging to the peer (chunk-A) region was written locally —
 # i.e. the consumer's permanent pool provably never holds chunk-A KV.
 # ---------------------------------------------------------------------------
-WRITE_TRACK: dict = {"enabled": False, "slots": set(), "overlap": 0}
+WRITE_TRACK: dict = {"enabled": False, "slots": set(), "overlap": 0, "skipped": 0}
 
 
 def reset_write_tracking() -> None:
     WRITE_TRACK["enabled"] = True
     WRITE_TRACK["slots"] = set()
     WRITE_TRACK["overlap"] = 0
+    WRITE_TRACK["skipped"] = 0
 
 
 # Continuous-batching evidence (validation only): largest number of requests
@@ -498,8 +499,11 @@ class HcpRingAttentionImpl(AttentionImpl):
         # NOT write the pool — the token's KV is routed by the growth
         # assignment policy (owner's compact buffer, or shipped to its
         # assignee).  The pool therefore durably holds only the owner's own
-        # chunk.  PoC scope: decode-ring runs are single-request.
+        # chunk.  PoC scope: decode-ring runs are single-request.  The skip
+        # is counted (slots alone cannot prove it: freed slots are recycled
+        # by later requests and collapse in the slot-id set).
         if n == 1 and _decode_ring_enabled() and DECODE_RING_MAP:
+            WRITE_TRACK["skipped"] += n
             return
         key_cache, value_cache = kv_cache.unbind(1)
         block_size = key_cache.shape[1]
