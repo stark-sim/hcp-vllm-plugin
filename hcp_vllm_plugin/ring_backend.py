@@ -178,8 +178,16 @@ def register_decode_ring(
 ) -> None:
     """peer_chunks: ordered (chunk_key, peer_url) pairs of the prefix.
     transport: RingTransport instance for P2P ring mode (None = HTTP star)."""
+    import uuid
+
     peers = [(ck, u) for ck, u in peer_chunks if u]
     DECODE_RING_MAP[first_block_id] = {
+        "peer_chunks": peers,
+        "prefix_len": prefix_len,
+        # Unique tag for this request's decode-ring lifetime: identifies its
+        # growth KV on every ring node (block ids are recycled across
+        # requests, so the bare block id is not a safe key).
+        "req_tag": f"{first_block_id}:{uuid.uuid4().hex[:8]}",
         "peer_chunks": peers,
         "prefix_len": prefix_len,
         # Ring indexing for growth assignment: 0..N-2 = peers in prefix
@@ -194,7 +202,7 @@ def register_decode_ring(
         # next step's RPC to its assignee (one-step pipeline lag).
         "pending_growth": {},
         "growth_policy": _growth_policy(),
-        # P2P ring transport (None = legacy HTTP star mode).
+        # P2P ring transport (required — star HTTP decode was removed).
         "transport": transport,
     }
 
@@ -501,17 +509,26 @@ class HcpRingAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return
         n = slot_mapping.shape[0]
-        # Memory-split decode with sharded growth: a decode-ring decode step
-        # (single-token write while a decode-ring registration is live) does
-        # NOT write the pool — the token's KV is routed by the growth
-        # assignment policy (owner's compact buffer, or shipped to its
-        # assignee).  The pool therefore durably holds only the owner's own
-        # chunk.  PoC scope: decode-ring runs are single-request.  The skip
-        # is counted (slots alone cannot prove it: freed slots are recycled
-        # by later requests and collapse in the slot-id set).
-        if n == 1 and _decode_ring_enabled() and DECODE_RING_MAP:
-            WRITE_TRACK["skipped"] += n
-            return
+        # Memory-split decode with sharded growth: a decode-ring request's
+        # single-token decode step does NOT write the pool — the token's KV
+        # is routed by the growth assignment policy (owner's compact buffer,
+        # or shipped to its assignee).  Per-request exact gating via the
+        # forward context's attention metadata (the n==1 heuristic broke
+        # for batched decode steps; ISSUE-004).  The skip is counted (slot
+        # ids alone cannot prove it: freed slots are recycled by later
+        # requests and collapse in the slot-id set).
+        skip = self._decode_ring_skip_positions(layer, slot_mapping)
+        if skip:
+            WRITE_TRACK["skipped"] += len(skip)
+            keep = [i for i in range(n) if i not in skip]
+            if not keep:
+                return
+            device = slot_mapping.device
+            idx = torch.tensor(keep, dtype=torch.long, device=device)
+            slot_mapping = slot_mapping.index_select(0, idx)
+            key = key.index_select(0, idx)
+            value = value.index_select(0, idx)
+            n = len(keep)
         key_cache, value_cache = kv_cache.unbind(1)
         block_size = key_cache.shape[1]
         block_idx = torch.div(slot_mapping, block_size, rounding_mode="floor")
@@ -520,6 +537,40 @@ class HcpRingAttentionImpl(AttentionImpl):
         value_cache[block_idx, block_off] = value[:n]
         if WRITE_TRACK["enabled"]:
             WRITE_TRACK["slots"].update(slot_mapping.tolist())
+
+    def _decode_ring_skip_positions(
+        self, layer: torch.nn.Module, slot_mapping: torch.Tensor
+    ) -> set[int]:
+        """Token positions (rows in this step's slot_mapping) belonging to
+        decode-ring requests' single-token decode steps.  Empty set when
+        the step is not a ring decode step (prefill, non-CP requests, or
+        metadata unavailable — conservative: never skip what we cannot
+        attribute)."""
+        if not (_decode_ring_enabled() and DECODE_RING_MAP):
+            return set()
+        try:
+            from vllm.forward_context import get_forward_context
+
+            raw = get_forward_context().attn_metadata
+            if isinstance(raw, dict):
+                meta = raw.get(layer.layer_name)
+            elif isinstance(raw, list):
+                meta = raw[0].get(layer.layer_name)
+            else:
+                meta = raw
+            if meta is None:
+                return set()
+            qsl = meta.query_start_loc.tolist()
+            block_table = meta.block_table
+            skip: set[int] = set()
+            for r in range(len(qsl) - 1):
+                if qsl[r + 1] - qsl[r] == 1 and (
+                    int(block_table[r, 0]) in DECODE_RING_MAP
+                ):
+                    skip.add(qsl[r])
+            return skip
+        except Exception:  # noqa: BLE001 — conservative: skip nothing
+            return set()
 
     # -- forward -------------------------------------------------------------
     def forward(
@@ -667,6 +718,7 @@ class HcpRingAttentionImpl(AttentionImpl):
                     self.scale,
                     layer_name,
                     first_chunk,
+                    req=dr["req_tag"],
                     growth_k=gk,
                     growth_v=gv,
                     growth_target=growth_target,

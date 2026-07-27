@@ -43,15 +43,22 @@ MODEL = "/home/stark/models/Qwen2-0.5B-1M"
 NUM_LAYERS = 24  # Qwen2-0.5B
 
 
-def build_prompt_ids(total: int) -> list[int]:
+def build_prompt_ids(total: int, variant: int = 0) -> list[int]:
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL)
-    text = " ".join(
-        f"Paragraph {i}: the quick brown fox jumps over the lazy dog, "
-        f"then counts {i} clouds drifting over mountain {i % 7}."
-        for i in range(1024)
-    )
+    if variant == 0:
+        text = " ".join(
+            f"Paragraph {i}: the quick brown fox jumps over the lazy dog, "
+            f"then counts {i} clouds drifting over mountain {i % 7}."
+            for i in range(1024)
+        )
+    else:
+        text = " ".join(
+            f"Chapter {i}: a curious traveler maps {i} distant islands, "
+            f"recording harbor {i % 5} and the color of its tides."
+            for i in range(1024)
+        )
     ids = tok(text, add_special_tokens=False)["input_ids"]
     assert len(ids) >= total, f"prompt too short: {len(ids)} < {total}"
     return ids[:total]
@@ -157,7 +164,8 @@ def _print_ring_node_stats() -> None:
             print(
                 f"RingDecodeNode[{node._ring_index}] final: calls={node.calls} "
                 f"growth_appends={node.growth_appends} "
-                f"growth_tokens_per_layer={node.growth_tokens()}",
+                f"growth_tokens_per_layer={node.growth_tokens()} "
+                f"per_req={node.growth_stats()}",
                 flush=True,
             )
     except Exception as e:
@@ -205,21 +213,32 @@ def mode_relay(args) -> None:
 
 def mode_consumer(args) -> None:
     import torch
-    from vllm import LLM
+    from vllm import LLM, SamplingParams
+    from vllm.inputs import TokensPrompt
 
+    N = args.concurrent
     s2 = args.total - args.split0 - args.split1
-    ids = build_prompt_ids(args.total)
-    print(f"[C/owner] full prompt = {len(ids)} (prefix c0+c1 = "
-          f"{args.split0 + args.split1} external, own c2 = {s2}); "
-          f"peers A={args.url_a} B={args.url_b}; "
+    prompts = [build_prompt_ids(args.total, variant=i) for i in range(N)]
+    print(f"[C/owner] {N} concurrent request(s), prompt = {len(prompts[0])} "
+          f"each (prefix c0+c1 = {args.split0 + args.split1} external, "
+          f"own c2 = {s2}); peers A={args.url_a} B={args.url_b}; "
           f"ring TCP :{args.decode_port_c} (idx 0)", flush=True)
 
-    # ---- single-node reference ----
+    # ---- single-node reference (batched over all requests) ----
     ref = LLM(model=MODEL, dtype="float16", enforce_eager=True,
               gpu_memory_utilization=args.gpu_mem_c, max_model_len=args.max_model_len,
-              max_num_seqs=1, disable_hybrid_kv_cache_manager=True, seed=0)
-    ref_logits, ref_tokens = run_capture(ref, ids, args.decode)
-    print(f"[ref] tokens: {ref_tokens}", flush=True)
+              max_num_seqs=N, disable_hybrid_kv_cache_manager=True, seed=0)
+    if N == 1:
+        ref_logits, ref_tokens_one = run_capture(ref, prompts[0], args.decode)
+        ref_tokens_list = [ref_tokens_one]
+    else:
+        ref_logits = None
+        ref_outs = ref.generate(
+            [TokensPrompt(prompt_token_ids=p) for p in prompts],
+            SamplingParams(temperature=0.0, max_tokens=args.decode),
+        )
+        ref_tokens_list = [list(o.outputs[0].token_ids) for o in ref_outs]
+    print(f"[ref] tokens: {ref_tokens_list}", flush=True)
     try:
         ref.llm_engine.shutdown()
     except Exception:
@@ -243,7 +262,7 @@ def mode_consumer(args) -> None:
     }, "kv_consumer")
     cons = LLM(model=MODEL, dtype="float16", enforce_eager=True,
                gpu_memory_utilization=args.gpu_mem_c, max_model_len=args.max_model_len,
-               max_num_seqs=1, disable_hybrid_kv_cache_manager=True,
+               max_num_seqs=N, disable_hybrid_kv_cache_manager=True,
                enable_prefix_caching=False,
                attention_backend="CUSTOM", kv_transfer_config=cfg, seed=0)
     import hcp_vllm_plugin.ring_backend as rb
@@ -251,32 +270,36 @@ def mode_consumer(args) -> None:
     rb.reset_write_tracking()
     rb.reset_staging_stats()
     rb.reset_impl_stats()
-    from vllm import SamplingParams
-    from vllm.inputs import TokensPrompt
 
-    model = find_model(cons)
-    lp = getattr(model, "logits_processor", None)
     captured: list[torch.Tensor] = []
+    h = None
+    if N == 1:
+        model = find_model(cons)
+        lp = getattr(model, "logits_processor", None)
 
-    def hook(_mod, _inp, out):
-        t = out[0] if isinstance(out, (tuple, list)) else out
-        if torch.is_tensor(t):
-            captured.append(t.detach().float().cpu())
+        def hook(_mod, _inp, out):
+            t = out[0] if isinstance(out, (tuple, list)) else out
+            if torch.is_tensor(t):
+                captured.append(t.detach().float().cpu())
 
-    h = lp.register_forward_hook(hook)
-    sp = SamplingParams(
-        temperature=0.0, max_tokens=args.decode,
-        extra_args={"kv_transfer_params": {"hcp_ring": {
-            "chunk_ids": ["c0", "c1"],
-            "peer_urls": [args.url_a, args.url_b],
-            "prefix_len": args.split0 + args.split1,
-        }}},
-    )
-    outs = cons.generate([TokensPrompt(prompt_token_ids=ids)], sp)
-    h.remove()
-    cons_tokens = list(outs[0].outputs[0].token_ids)
-    cons_logits = captured[-1].reshape(-1)
-    print(f"[consumer] tokens: {cons_tokens}", flush=True)
+        h = lp.register_forward_hook(hook)
+    sp_list = [
+        SamplingParams(
+            temperature=0.0, max_tokens=args.decode,
+            extra_args={"kv_transfer_params": {"hcp_ring": {
+                "chunk_ids": ["c0", "c1"],
+                "peer_urls": [args.url_a, args.url_b],
+                "prefix_len": args.split0 + args.split1,
+            }}},
+        )
+        for _ in range(N)
+    ]
+    outs = cons.generate([TokensPrompt(prompt_token_ids=p) for p in prompts],
+                         sp_list)
+    if h is not None:
+        h.remove()
+    cons_tokens_list = [list(o.outputs[0].token_ids) for o in outs]
+    print(f"[consumer] tokens: {cons_tokens_list}", flush=True)
 
     # ---- MEMORY-SPLIT evidence ----
     staging_left = len(rb.PEER_KV_STAGING)
@@ -284,46 +307,62 @@ def mode_consumer(args) -> None:
     ring_map_left = len(rb.DECODE_RING_MAP)
     print(f"[decode-p2p] staging right after generate: "
           f"PEER_KV_STAGING={staging_left} PEER_REQ_MAP={map_left} "
-          f"DECODE_RING_MAP={ring_map_left}", flush=True)
+          f"DECODE_RING_MAP={ring_map_left} (expected {N} live)", flush=True)
 
     # Flush to trigger cleanup
-    cons.generate([TokensPrompt(prompt_token_ids=ids[:32])],
+    cons.generate([TokensPrompt(prompt_token_ids=prompts[0][:32])],
                   SamplingParams(temperature=0.0, max_tokens=1,
                                  extra_args={"kv_transfer_params":
                                              {"hcp_ring": {"prefix_len": 0}}}))
     ring_map_after = len(rb.DECODE_RING_MAP)
 
     # ---- correctness ----
-    token_match = cons_tokens == ref_tokens
-    max_diff = (ref_logits - cons_logits).abs().max().item()
-    argmax_diff = (ref_logits - cons_logits).abs()[ref_logits.argmax()].item()
+    token_match = cons_tokens_list == ref_tokens_list
+    if N == 1:
+        cons_logits = captured[-1].reshape(-1)
+        max_diff = (ref_logits - cons_logits).abs().max().item()
+        argmax_diff = (ref_logits - cons_logits).abs()[ref_logits.argmax()].item()
+        logits_ok = max_diff < 0.1
+    else:
+        max_diff = argmax_diff = float("nan")
+        logits_ok = True  # N>1: token equality is the correctness evidence
+        print("[decode-p2p] N>1: logits diff check skipped "
+              "(token equality is the correctness evidence)", flush=True)
 
+    max_reqs = rb.BATCH_STATS["max_reqs"]
+    max_reqs_ok = max_reqs >= N
     n_written = len(rb.WRITE_TRACK["slots"])
-    expected_slots = s2 + 40
+    expected_slots = N * s2 + 40
     slots_ok = n_written <= expected_slots
-    decode_split_ok = staging_left == 0 and map_left == 0
+    decode_split_ok = staging_left == 0 and map_left == 0 and ring_map_left == N
     ring_clean_ok = ring_map_after == 0
     impl_ok = (
         rb.IMPL_STATS["attn_triton"] > 0 and rb.IMPL_STATS["attn_torch"] == 0
     )
-    expected_skips = (args.decode - 1) * NUM_LAYERS
+    expected_skips = N * (args.decode - 1) * NUM_LAYERS
     skip_count = rb.WRITE_TRACK.get("skipped", 0)
     skip_ok = skip_count == expected_skips
-    # Streaming prefill: transient GPU staging bounded at all times —
-    # (window+1) layers × num prefix chunks, never the full prefix.
+    # Streaming prefill: transient GPU staging bounded per stream —
+    # (window+1) layers × num prefix chunks × N requests.
     max_staged = rb.STAGING_STATS["max_staged_layers"]
-    stream_bound = 6
+    stream_bound = N * 6
     window_ok = max_staged <= stream_bound
     print(f"[decode-p2p] peak staged layers: {max_staged} "
-          f"(streaming bound <= {stream_bound}): "
+          f"(streaming bound <= {stream_bound} = N x (window+1) x chunks): "
           f"{'OK' if window_ok else 'VIOLATED'}", flush=True)
+    print(f"[decode-p2p] batch max_reqs: {max_reqs} (expected >= {N}): "
+          f"{'OK' if max_reqs_ok else 'VIOLATED'}", flush=True)
 
     # Ring transport evidence
     from hcp_vllm_plugin.ring_transport import get_ring_transport
     transport = get_ring_transport()
-    transport_ok = transport is not None and transport.packets_sent > 0
-    print(f"[decode-p2p] ring transport: sent={transport.packets_sent if transport else 0} "
-          f"recv={transport.packets_recv if transport else 0}", flush=True)
+    sent = transport.packets_sent if transport else 0
+    recv = transport.packets_recv if transport else 0
+    expected_packets = N * (args.decode - 1) * NUM_LAYERS
+    transport_ok = sent == expected_packets and recv == expected_packets
+    print(f"[decode-p2p] ring transport: sent={sent} recv={recv} "
+          f"(expected {expected_packets} = N x (decode-1) x layers): "
+          f"{'OK' if transport_ok else 'VIOLATED'}", flush=True)
 
     print(f"[impl] attn triton/torch: {rb.IMPL_STATS['attn_triton']}/"
           f"{rb.IMPL_STATS['attn_torch']}, merge triton/torch: "
@@ -334,14 +373,17 @@ def mode_consumer(args) -> None:
           f"(expected {expected_skips}): {'OK' if skip_ok else 'VIOLATED'}")
     print(f"[decode-p2p] decode-ring map cleared: {ring_map_after == 0}")
 
-    ok = (token_match and max_diff < 0.1 and decode_split_ok
+    ok = (token_match and logits_ok and decode_split_ok
           and ring_clean_ok and slots_ok and skip_ok and impl_ok
-          and transport_ok and window_ok)
+          and transport_ok and window_ok and max_reqs_ok)
     print("--- result ---")
-    print(f"  tokens match        : {token_match} (ref={ref_tokens} "
-          f"cons={cons_tokens})")
-    print(f"  max|logit diff|     : {max_diff:.6f} (at ref argmax: "
-          f"{argmax_diff:.6f})")
+    print(f"  tokens match        : {token_match}")
+    for i in range(N):
+        print(f"    req{i}: ref={ref_tokens_list[i]} cons={cons_tokens_list[i]}")
+    if N == 1:
+        print(f"  max|logit diff|     : {max_diff:.6f} (at ref argmax: "
+              f"{argmax_diff:.6f})")
+    print(f"  concurrent batch    : {'OK' if max_reqs_ok else 'VIOLATED'}")
     print(f"  memsplit decode     : {'OK' if decode_split_ok else 'VIOLATED'}")
     print(f"  slots accounting    : {'OK' if slots_ok else 'VIOLATED'}")
     print(f"  pool-skip evidence  : {'OK' if skip_ok else 'VIOLATED'}")
@@ -427,7 +469,8 @@ def mode_all(args) -> None:
         [sys.executable, script, "--mode", "consumer", *common,
          "--url-a", f"http://127.0.0.1:{args.port_a}",
          "--url-b", f"http://127.0.0.1:{args.port_b}",
-         "--decode", str(args.decode)],
+         "--decode", str(args.decode),
+         "--concurrent", str(args.concurrent)],
         stdout=open("/tmp/ring_p2p_c.log", "w"), stderr=subprocess.STDOUT,
     )
     with open(args.done_file, "w") as f:
@@ -458,6 +501,9 @@ def main() -> None:
     ap.add_argument("--split0", type=int, default=512)
     ap.add_argument("--split1", type=int, default=512)
     ap.add_argument("--decode", type=int, default=8)
+    ap.add_argument("--concurrent", type=int, default=1,
+                    help="number of concurrent CP requests in the consumer "
+                         "(>=2 proves multi-request decode-ring isolation)")
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--run-id", default="run")
     ap.add_argument("--port-a", type=int, default=8901)

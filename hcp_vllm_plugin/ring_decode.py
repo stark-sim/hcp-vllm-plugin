@@ -106,9 +106,12 @@ class RingDecodeNode:
         self._ring_index = ring_index
         # (chunk_key, layer_name) -> (k, v)
         self._layers: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
-        # layer_name -> (k, v): decode-growth tokens assigned to THIS node
-        self._growth: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-        self._growth_appends = 0
+        # (req_tag, layer_name) -> (k, v): decode-growth tokens assigned to
+        # THIS node, ISOLATED PER REQUEST — without the request dimension,
+        # concurrent requests' growth would mix into every partial (a
+        # correctness bug, not just an accounting one; ISSUE-004).
+        self._growth: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._growth_appends: dict[str, int] = {}
         self._ready = threading.Event()
         self._calls = 0
         self._store_dir = store_dir
@@ -157,12 +160,23 @@ class RingDecodeNode:
 
     @property
     def growth_appends(self) -> int:
-        return self._growth_appends
+        return sum(self._growth_appends.values())
 
     def growth_tokens(self) -> int:
+        """Total growth tokens per layer summed across requests."""
         if not self._growth:
             return 0
-        return next(iter(self._growth.values()))[0].shape[0]
+        per_req: dict[str, int] = {}
+        for (req, _layer), (k, _v) in self._growth.items():
+            per_req[req] = k.shape[0]
+        return sum(per_req.values())
+
+    def growth_stats(self) -> dict[str, int]:
+        """Per-request growth tokens per layer (isolation evidence)."""
+        per_req: dict[str, int] = {}
+        for (req, _layer), (k, _v) in self._growth.items():
+            per_req[req] = k.shape[0]
+        return per_req
 
     def is_ready(self) -> bool:
         return self._ready.is_set()
@@ -177,6 +191,7 @@ class RingDecodeNode:
         tensors = safetensors.torch.load(payload)
         chunk = bytes(tensors["chunk"].tolist()).decode()
         layer = bytes(tensors["layer"].tolist()).decode()
+        req = bytes(tensors["req"].tolist()).decode() if "req" in tensors else ""
         q = tensors["q"].to(self._device, self._dtype)
         o_acc = tensors["o"].to(self._device, self._dtype)
         lse_acc = tensors["lse"].to(self._device, torch.float32)
@@ -184,27 +199,29 @@ class RingDecodeNode:
 
         # Append piggyback growth KV ONLY if this node is the target.
         # The packet carries growth_target (transport ring index of the
-        # assignee); intermediate nodes forward it unchanged.
+        # assignee); intermediate nodes forward it unchanged.  Growth is
+        # keyed by (req, layer): per-request isolation.
         growth_consumed = False
         if "growth_k" in tensors:
             target = int(tensors["growth_target"].item()) if "growth_target" in tensors else self._ring_index
             if target == self._ring_index:
                 gk = tensors["growth_k"].to(self._device, self._dtype)
                 gv = tensors["growth_v"].to(self._device, self._dtype)
-                prev = self._growth.get(layer)
-                self._growth[layer] = (
+                gkey = (req, layer)
+                prev = self._growth.get(gkey)
+                self._growth[gkey] = (
                     gk if prev is None else torch.cat([prev[0], gk], dim=0),
                     gv if prev is None else torch.cat([prev[1], gv], dim=0),
                 )
-                self._growth_appends += 1
+                self._growth_appends[req] = self._growth_appends.get(req, 0) + 1
                 growth_consumed = True
 
-        # Local partial attention: chunk snapshot + growth (non-causal).
-        # In ring mode each node uses its OWN chunk key (the packet's chunk
-        # field is the first peer's key — irrelevant for other nodes).
+        # Local partial attention: chunk snapshot + THIS REQUEST's growth
+        # (non-causal).  In ring mode each node uses its OWN chunk key (the
+        # packet's chunk field is the first peer's key — irrelevant here).
         my_chunk = self._chunk_keys[0] if self._chunk_keys else chunk
         k, v = self._layers[(my_chunk, layer)]
-        g = self._growth.get(layer)
+        g = self._growth.get((req, layer))
         if g is not None:
             k = torch.cat([k, g[0]], dim=0)
             v = torch.cat([v, g[1]], dim=0)
@@ -220,7 +237,8 @@ class RingDecodeNode:
                 self._ring_index, self._calls,
             )
 
-        # Build updated packet (preserve q, scale, chunk, layer for next hop)
+        # Build updated packet (preserve q, scale, chunk, layer, req for
+        # the next hop)
         out_dict = {
             "chunk": tensors["chunk"],
             "layer": tensors["layer"],
@@ -229,6 +247,8 @@ class RingDecodeNode:
             "lse": lse.detach().contiguous().cpu(),
             "scale": tensors["scale"],
         }
+        if "req" in tensors:
+            out_dict["req"] = tensors["req"]
         # Forward growth if it was NOT consumed by this node (destined for
         # a downstream ring neighbor).
         if "growth_k" in tensors and not growth_consumed:
@@ -299,6 +319,7 @@ def ring_decode_step(
     scale: float,
     layer: str,
     chunk: str,
+    req: str = "",
     growth_k: torch.Tensor | None = None,
     growth_v: torch.Tensor | None = None,
     growth_target: int = -1,
@@ -307,12 +328,15 @@ def ring_decode_step(
     """Owner-side entry: initiate one accumulator packet into the ring and
     block until it returns after traversing all peers.
 
+    `req` uniquely identifies the request's decode-ring lifetime; every
+    node's growth buffer is keyed by it (per-request isolation).
     Returns the final (O, LSE) — the globally exact attention output for
     this layer's decode step.
     """
     payload_dict = {
         "chunk": torch.tensor(list(chunk.encode()), dtype=torch.uint8),
         "layer": torch.tensor(list(layer.encode()), dtype=torch.uint8),
+        "req": torch.tensor(list(req.encode()), dtype=torch.uint8),
         "q": q.detach().contiguous().cpu(),
         "o": o_acc.detach().contiguous().cpu(),
         "lse": lse_acc.detach().contiguous().cpu(),
