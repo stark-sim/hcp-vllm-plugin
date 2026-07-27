@@ -340,11 +340,17 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         ):
             self._start_http_server()
         # P2P ring decode transport (independent of HTTP store server).
+        # Ring is the ONLY decode transport (star HTTP removed).
         self._ring_transport = None
         self._ring_node = None
+        if os.environ.get("HCP_RING_DECODE_TRANSPORT", "ring") != "ring":
+            logger.warning(
+                "HCP_RING_DECODE_TRANSPORT=%s ignored: star HTTP decode was "
+                "removed; P2P ring is the only decode transport",
+                os.environ.get("HCP_RING_DECODE_TRANSPORT"),
+            )
         if (
             os.environ.get("HCP_RING_DECODE_RING", "1") == "1"
-            and os.environ.get("HCP_RING_DECODE_TRANSPORT", "ring") == "ring"
             and self._role == KVConnectorRole.WORKER
         ):
             self._start_ring_transport()
@@ -369,53 +375,26 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         )
 
     # ------------------------------------------------------------------
-    # HTTP transport (same pattern as HcpCpConnector)
+    # HTTP transport (prefill KV store only — star decode was removed)
     # ------------------------------------------------------------------
     def _start_http_server(self) -> None:
-        from http.server import ThreadingHTTPServer
+        from functools import partial
+        from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-        partial_service = None
-        decode_transport_mode = os.environ.get(
-            "HCP_RING_DECODE_TRANSPORT", "ring"
-        )
-        if (
-            os.environ.get("HCP_RING_DECODE_RING", "1") == "1"
-            and decode_transport_mode == "http"
-        ):
-            # Legacy HTTP star mode: PartialAttentionService on the same port.
-            from hcp_vllm_plugin.ring_decode import (
-                PartialAttentionService,
-                make_handler,
-            )
-
-            partial_chunks = [
-                s
-                for s in self._kv_transfer_config.get_from_extra_config(
-                    "ring_partial_chunks", self._chunk_id
-                ).split(",")
-                if s
-            ]
-            partial_service = PartialAttentionService(
-                self._run_dir(), partial_chunks
-            )
-            handler = make_handler(partial_service, self._shared_path)
-        else:
-            from functools import partial
-            from http.server import SimpleHTTPRequestHandler
-
-            handler = partial(
-                SimpleHTTPRequestHandler, directory=self._shared_path
-            )
+        # Star HTTP decode (/partial_attn owner-to-all-peers) was removed:
+        # N>3 networks are not fully connected, and ring keeps topology
+        # linear (decision-no-star-transport-20260727).  This server now
+        # serves ONLY the prefill KV store files.
+        handler = partial(SimpleHTTPRequestHandler, directory=self._shared_path)
         server = ThreadingHTTPServer(("0.0.0.0", self._serve_port), handler)
         server.daemon_threads = True
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
         self._http_server = server
-        self._partial_service = partial_service
         logger.info(
-            "HcpRingKvConnector serving KV store on 0.0.0.0:%d (partial_attn=%s)",
+            "HcpRingKvConnector serving KV store on 0.0.0.0:%d "
+            "(prefill store only; decode is P2P ring)",
             self._serve_port,
-            partial_service is not None,
         )
 
     def _start_ring_transport(self) -> None:
