@@ -381,7 +381,7 @@ class HcpRingKvConnector(KVConnectorBase_V1):
           ring_decode_port  : TCP port for this node (default 8950).
           ring_partial_chunks : comma-separated chunk keys this node serves.
         """
-        from hcp_vllm_plugin.ring_transport import RingTransport
+        from hcp_vllm_plugin.ring_transport import init_ring_transport
         from hcp_vllm_plugin.ring_decode import RingDecodeNode
 
         cfg = self._kv_transfer_config
@@ -440,9 +440,9 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                 if my_chunk in ids:
                     my_index = ids.index(my_chunk)
 
-        # Initialize transport
-        self._ring_transport = RingTransport(ring_addrs, my_index)
-        self._ring_transport.start()
+        # Initialize transport via the module singleton so in-process
+        # consumers (validation probes) can find it via get_ring_transport().
+        self._ring_transport = init_ring_transport(ring_addrs, my_index)
 
         # Initialize RingDecodeNode (loads chunk KV snapshot for serving)
         partial_chunks = [
