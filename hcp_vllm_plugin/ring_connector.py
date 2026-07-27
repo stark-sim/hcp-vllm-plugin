@@ -292,6 +292,15 @@ class HcpRingKvConnector(KVConnectorBase_V1):
             and self._role == KVConnectorRole.WORKER
         ):
             self._start_http_server()
+        # P2P ring decode transport (independent of HTTP store server).
+        self._ring_transport = None
+        self._ring_node = None
+        if (
+            os.environ.get("HCP_RING_DECODE_RING", "0") == "1"
+            and os.environ.get("HCP_RING_DECODE_TRANSPORT", "ring") == "ring"
+            and self._role == KVConnectorRole.WORKER
+        ):
+            self._start_ring_transport()
         # Decode-ring: let the backend release staged prefix KV (refcount
         # aware) when a request enters the decode phase.  Only the WORKER-side
         # instance owns _live (start_load_kv); EngineCore builds the model
@@ -319,7 +328,14 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         from http.server import ThreadingHTTPServer
 
         partial_service = None
-        if os.environ.get("HCP_RING_DECODE_RING", "0") == "1":
+        decode_transport_mode = os.environ.get(
+            "HCP_RING_DECODE_TRANSPORT", "ring"
+        )
+        if (
+            os.environ.get("HCP_RING_DECODE_RING", "0") == "1"
+            and decode_transport_mode == "http"
+        ):
+            # Legacy HTTP star mode: PartialAttentionService on the same port.
             from hcp_vllm_plugin.ring_decode import (
                 PartialAttentionService,
                 make_handler,
@@ -353,6 +369,104 @@ class HcpRingKvConnector(KVConnectorBase_V1):
             "HcpRingKvConnector serving KV store on 0.0.0.0:%d (partial_attn=%s)",
             self._serve_port,
             partial_service is not None,
+        )
+
+    def _start_ring_transport(self) -> None:
+        """Initialize P2P ring TCP transport + RingDecodeNode for decode.
+
+        Config keys:
+          ring_decode_order : comma-separated "host:port" in ring order
+                              (index 0 = owner).  If empty, derived from
+                              ring_order URLs + ring_decode_port.
+          ring_decode_port  : TCP port for this node (default 8950).
+          ring_partial_chunks : comma-separated chunk keys this node serves.
+        """
+        from hcp_vllm_plugin.ring_transport import RingTransport
+        from hcp_vllm_plugin.ring_decode import RingDecodeNode
+
+        cfg = self._kv_transfer_config
+        decode_port = int(cfg.get_from_extra_config("ring_decode_port", "8950"))
+        order_str = cfg.get_from_extra_config("ring_decode_order", "")
+
+        if order_str:
+            # Explicit "host:port,host:port,..." ring order
+            ring_addrs = []
+            for spec in order_str.split(","):
+                spec = spec.strip()
+                host, port_s = spec.rsplit(":", 1)
+                ring_addrs.append((host, int(port_s)))
+        else:
+            # Derive from ring_order: extract hosts from URLs, use decode_port
+            order = cfg.get_from_extra_config("ring_order", "")
+            if not order:
+                logger.warning(
+                    "HcpRingKvConnector: ring_decode_order and ring_order both "
+                    "empty; cannot start ring transport"
+                )
+                return
+            specs = [s for s in order.split(",") if s]
+            ring_addrs = []
+            for s in specs:
+                if "@" in s:
+                    url = s.split("@", 1)[1].rstrip("/")
+                    # Extract host from URL like "http://host:port"
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    host = parsed.hostname or "127.0.0.1"
+                else:
+                    host = "127.0.0.1"
+                ring_addrs.append((host, decode_port))
+
+        # Determine my index in the transport ring.
+        # Priority: ring_decode_index (explicit) > match by port in
+        # ring_decode_order > derive from ring_order prefill position.
+        explicit_idx = cfg.get_from_extra_config("ring_decode_index", "")
+        if explicit_idx:
+            my_index = int(explicit_idx)
+        elif order_str:
+            # Match my decode port against the ring_decode_order entries
+            my_index = 0
+            for i, (h, p) in enumerate(ring_addrs):
+                if p == decode_port:
+                    my_index = i
+                    break
+        else:
+            my_chunk = cfg.get_from_extra_config("ring_my_chunk", self._chunk_id)
+            order = cfg.get_from_extra_config("ring_order", "")
+            my_index = 0
+            if order:
+                specs = [s for s in order.split(",") if s]
+                ids = [s.split("@")[0] for s in specs]
+                if my_chunk in ids:
+                    my_index = ids.index(my_chunk)
+
+        # Initialize transport
+        self._ring_transport = RingTransport(ring_addrs, my_index)
+        self._ring_transport.start()
+
+        # Initialize RingDecodeNode (loads chunk KV snapshot for serving)
+        partial_chunks = [
+            s
+            for s in cfg.get_from_extra_config(
+                "ring_partial_chunks", self._chunk_id
+            ).split(",")
+            if s
+        ]
+        self._ring_node = RingDecodeNode(
+            self._run_dir(), partial_chunks, my_index
+        )
+
+        # Non-owner nodes start the relay worker thread immediately.
+        # Owner does NOT run relay — it initiates packets synchronously
+        # from within the vLLM forward pass.
+        if my_index != 0:
+            self._ring_node.wait_ready(timeout_s=600)
+            self._ring_node.start_relay(self._ring_transport)
+
+        logger.info(
+            "HcpRingKvConnector: ring transport started (index=%d, "
+            "addrs=%s, chunks=%s, relay=%s)",
+            my_index, ring_addrs, partial_chunks, my_index != 0,
         )
 
     def _fetch(self, rel_path: str, dest_path: str, peer_url: str = "") -> bool:
@@ -620,7 +734,10 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                 (ck, (u or self._peer_url).rstrip("/"))
                 for ck, u in zip(req.chunk_keys, req.peer_urls)
             ]
-            register_decode_ring(req.first_block_id, pairs, expected_total)
+            register_decode_ring(
+                req.first_block_id, pairs, expected_total,
+                transport=getattr(self, "_ring_transport", None),
+            )
             self._ring_blocks[req.req_id] = req.first_block_id
 
     def _load_layer(

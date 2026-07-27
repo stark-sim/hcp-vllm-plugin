@@ -164,15 +164,23 @@ def _growth_policy() -> str:
     return os.environ.get("HCP_RING_DECODE_GROWTH", "rr")
 
 
+def _decode_ring_transport() -> str:
+    """Transport mode for the decode accumulator ring: "ring" (P2P TCP) or
+    "http" (legacy star HTTP)."""
+    return os.environ.get("HCP_RING_DECODE_TRANSPORT", "ring")
+
+
 def set_staging_release_fn(fn) -> None:
     global _STAGING_RELEASE_FN
     _STAGING_RELEASE_FN = fn
 
 
 def register_decode_ring(
-    first_block_id: int, peer_chunks: list[tuple[str, str]], prefix_len: int
+    first_block_id: int, peer_chunks: list[tuple[str, str]], prefix_len: int,
+    transport=None,
 ) -> None:
-    """peer_chunks: ordered (chunk_key, peer_url) pairs of the prefix."""
+    """peer_chunks: ordered (chunk_key, peer_url) pairs of the prefix.
+    transport: RingTransport instance for P2P ring mode (None = HTTP star)."""
     peers = [(ck, u) for ck, u in peer_chunks if u]
     DECODE_RING_MAP[first_block_id] = {
         "peer_chunks": peers,
@@ -189,6 +197,8 @@ def register_decode_ring(
         # next step's RPC to its assignee (one-step pipeline lag).
         "pending_growth": {},
         "growth_policy": _growth_policy(),
+        # P2P ring transport (None = legacy HTTP star mode).
+        "transport": transport,
     }
 
 
@@ -629,21 +639,55 @@ class HcpRingAttentionImpl(AttentionImpl):
                     )
                 else:
                     dr["pending_growth"][layer_name] = (assignee, k_cur, v_cur)
-                for idx, (ck, peer_url) in enumerate(dr["peer_chunks"]):
+                transport = dr.get("transport")
+                if transport is not None and _decode_ring_transport() == "ring":
+                    # P2P ring mode: one ring_decode_step call replaces the
+                    # entire peer for-loop.  The packet traverses all peers
+                    # and returns the globally merged result.
+                    from hcp_vllm_plugin.ring_decode import ring_decode_step
+
+                    # Growth piggyback: ship last step's pending growth to
+                    # its assignee via the ring packet.
                     gk = gv = None
-                    if ship is not None and ship[0] == idx:
+                    growth_target = -1
+                    if ship is not None:
                         gk, gv = ship[1], ship[2]
-                    o_acc, lse_acc = merge_remote_partial(
-                        peer_url,
-                        ck,
-                        layer_name,
+                        # Map growth assignee index to transport ring index:
+                        # growth 0..N-2 = peers -> transport 1..N-1
+                        growth_target = ship[0] + 1
+                    # The first peer's chunk key identifies the KV segment
+                    # for the ring nodes (all peers share the same layer
+                    # name; chunk key routes to the correct snapshot).
+                    first_chunk = dr["peer_chunks"][0][0] if dr["peer_chunks"] else ""
+                    o_acc, lse_acc = ring_decode_step(
+                        transport,
                         q_r,
                         o_acc,
                         lse_acc,
                         self.scale,
+                        layer_name,
+                        first_chunk,
                         growth_k=gk,
                         growth_v=gv,
+                        growth_target=growth_target,
                     )
+                else:
+                    # Legacy HTTP star mode: owner calls each peer sequentially.
+                    for idx, (ck, peer_url) in enumerate(dr["peer_chunks"]):
+                        gk = gv = None
+                        if ship is not None and ship[0] == idx:
+                            gk, gv = ship[1], ship[2]
+                        o_acc, lse_acc = merge_remote_partial(
+                            peer_url,
+                            ck,
+                            layer_name,
+                            q_r,
+                            o_acc,
+                            lse_acc,
+                            self.scale,
+                            growth_k=gk,
+                            growth_v=gv,
+                        )
                 output[qs:qe] = o_acc.to(output.dtype)
                 continue
             # Determine the peer (prefix) KV for THIS request.  Lookup is
