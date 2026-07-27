@@ -103,7 +103,11 @@ def _base_cfg(ring_cfg: dict, kv_role: str) -> dict:
 
 
 def _ring_decode_order(args) -> str:
-    """Transport ring order: C(owner,0) -> A(1) -> B(2) -> C."""
+    """Transport ring order: C(owner,0) -> A(1) -> B(2) -> C.
+    Single-node default uses loopback; --ring-order overrides with real
+    "host:port,..." entries for cross-node runs."""
+    if getattr(args, "ring_order", ""):
+        return args.ring_order
     return (
         f"127.0.0.1:{args.decode_port_c},"
         f"127.0.0.1:{args.decode_port_a},"
@@ -450,6 +454,10 @@ def main() -> None:
     ap.add_argument("--decode-port-a", type=int, default=8951)
     ap.add_argument("--decode-port-b", type=int, default=8952)
     ap.add_argument("--decode-port-c", type=int, default=8950)
+    ap.add_argument("--ring-order", default="",
+                    help='explicit "host:port,..." decode ring order '
+                         "(index 0 = owner); overrides the loopback default "
+                         "for cross-node runs")
     ap.add_argument("--url-a", default="")
     ap.add_argument("--url-b", default="")
     ap.add_argument("--store-a", default="/tmp/hcp_ring_p2p_store_a")
