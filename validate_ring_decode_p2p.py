@@ -309,6 +309,14 @@ def mode_consumer(args) -> None:
     expected_skips = (args.decode - 1) * NUM_LAYERS
     skip_count = rb.WRITE_TRACK.get("skipped", 0)
     skip_ok = skip_count == expected_skips
+    # Streaming prefill: transient GPU staging bounded at all times —
+    # (window+1) layers × num prefix chunks, never the full prefix.
+    max_staged = rb.STAGING_STATS["max_staged_layers"]
+    stream_bound = 6
+    window_ok = max_staged <= stream_bound
+    print(f"[decode-p2p] peak staged layers: {max_staged} "
+          f"(streaming bound <= {stream_bound}): "
+          f"{'OK' if window_ok else 'VIOLATED'}", flush=True)
 
     # Ring transport evidence
     from hcp_vllm_plugin.ring_transport import get_ring_transport
@@ -327,7 +335,8 @@ def mode_consumer(args) -> None:
     print(f"[decode-p2p] decode-ring map cleared: {ring_map_after == 0}")
 
     ok = (token_match and max_diff < 0.1 and decode_split_ok
-          and ring_clean_ok and slots_ok and skip_ok and impl_ok and transport_ok)
+          and ring_clean_ok and slots_ok and skip_ok and impl_ok
+          and transport_ok and window_ok)
     print("--- result ---")
     print(f"  tokens match        : {token_match} (ref={ref_tokens} "
           f"cons={cons_tokens})")
@@ -336,6 +345,7 @@ def mode_consumer(args) -> None:
     print(f"  memsplit decode     : {'OK' if decode_split_ok else 'VIOLATED'}")
     print(f"  slots accounting    : {'OK' if slots_ok else 'VIOLATED'}")
     print(f"  pool-skip evidence  : {'OK' if skip_ok else 'VIOLATED'}")
+    print(f"  streaming window    : {'OK' if window_ok else 'VIOLATED'}")
     print(f"  triton kernel path  : {'OK' if impl_ok else 'NOT USED'}")
     print(f"  ring transport used : {'OK' if transport_ok else 'NOT USED'}")
     print(f"  verdict: {'PASS' if ok else 'FAIL'}", flush=True)

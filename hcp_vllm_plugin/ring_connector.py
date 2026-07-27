@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.request
@@ -102,6 +103,7 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from hcp_vllm_plugin.ring_backend import (
+    PEER_KV_STAGING,
     clear_decode_ring,
     drop_chunk_kv,
     map_request_peer,
@@ -122,6 +124,49 @@ logger = init_logger(__name__)
 
 def _align_down(num_tokens: int, block_size: int) -> int:
     return (num_tokens // block_size) * block_size
+
+
+def _decode_ring_on() -> bool:
+    """Decode-ring (memory-split decode + streaming prefill) is the DEFAULT.
+    HCP_RING_DECODE_RING=0 explicitly selects the legacy owner-collapse
+    comparison path (bulk staging, NOT memory-split)."""
+    return os.environ.get("HCP_RING_DECODE_RING", "1") == "1"
+
+
+_STREAM_WINDOW = int(os.environ.get("HCP_RING_STREAM_WINDOW", "2"))
+
+
+def _layer_index(layer_name: str) -> int:
+    m = re.search(r"layers\.(\d+)\.", layer_name)
+    return int(m.group(1)) if m else 0
+
+
+class _PrefillStream:
+    """One request's streaming-prefill pipeline state.
+
+    A background worker thread fetches per-layer prefix KV in model order
+    into the ring backend's TRANSIENT staging, never running more than
+    _STREAM_WINDOW layers ahead of the consumption watermark advanced by
+    wait_for_layer_load().  GPU transient staging is therefore bounded to
+    ~(window+1) layers x num_chunks at ALL times (disk store untouched) —
+    the fix for the bulk full-prefix transient staging (ISSUE-003).
+    """
+
+    def __init__(
+        self,
+        req_id: str,
+        layers: list[str],
+        chunk_urls: list[tuple[str, str]],
+        expected_total: int,
+    ) -> None:
+        self.req_id = req_id
+        self.layers = layers
+        self.chunk_urls = chunk_urls
+        self.expected_total = expected_total
+        self.events = {ln: threading.Event() for ln in layers}
+        self.consumed_idx = -1
+        self.error: Exception | None = None
+        self.done = threading.Event()
 
 
 def _ring_params_from_sampling(sampling_params: Any) -> dict[str, Any]:
@@ -283,6 +328,8 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         # req_id -> first_block_id, for finish-time decode-ring clearing
         # (the _live entry may already be released at decode start).
         self._ring_blocks: dict[str, int] = {}
+        # req_id -> streaming prefill pipeline state (decode-ring mode only).
+        self._streams: dict[str, "_PrefillStream"] = {}
         os.makedirs(self._run_dir(), exist_ok=True)
         # Producer-side WORKER connectors hold/serve KV; the scheduler-side
         # instance must not bind the HTTP port.
@@ -296,7 +343,7 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         self._ring_transport = None
         self._ring_node = None
         if (
-            os.environ.get("HCP_RING_DECODE_RING", "0") == "1"
+            os.environ.get("HCP_RING_DECODE_RING", "1") == "1"
             and os.environ.get("HCP_RING_DECODE_TRANSPORT", "ring") == "ring"
             and self._role == KVConnectorRole.WORKER
         ):
@@ -332,7 +379,7 @@ class HcpRingKvConnector(KVConnectorBase_V1):
             "HCP_RING_DECODE_TRANSPORT", "ring"
         )
         if (
-            os.environ.get("HCP_RING_DECODE_RING", "0") == "1"
+            os.environ.get("HCP_RING_DECODE_RING", "1") == "1"
             and decode_transport_mode == "http"
         ):
             # Legacy HTTP star mode: PartialAttentionService on the same port.
@@ -658,26 +705,67 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         need = [r for r in metadata.requests if not r.is_store]
         if not need:
             return
+        layer_order = list(forward_context.no_compile_layers.keys())
+        device = "cuda"
+        for _ln, _layer in forward_context.no_compile_layers.items():
+            kvc = getattr(_layer, "kv_cache", None)
+            if torch.is_tensor(kvc) and kvc.numel() > 0:
+                device = str(kvc.device)
+            break
+        streaming = _decode_ring_on()
+        if not streaming:
+            logger.warning(
+                "HcpRingKvConnector: HCP_RING_DECODE_RING=0 — legacy "
+                "owner-collapse path: BULK full-prefix staging (NOT "
+                "memory-split; comparison only)"
+            )
         for req in need:
             expected_total = _align_down(
                 req.prefix_len or self._prefix_len, self._block_size
             )
+            # Registration is synchronous (the backend binds the request to
+            # its chunk set from layer 0 of the prefill forward).
+            map_request_peer(req.first_block_id, req.chunk_keys)
+            self._live[req.req_id] = (req.first_block_id, list(req.chunk_keys))
+            for chunk_key in req.chunk_keys:
+                self._chunk_refs[chunk_key] = (
+                    self._chunk_refs.get(chunk_key, 0) + 1
+                )
+            # Decode-ring: register the accumulator-ring endpoints for this
+            # request ((chunk, url) pairs in prefix order).
+            pairs = [
+                (ck, (u or self._peer_url).rstrip("/"))
+                for ck, u in zip(req.chunk_keys, req.peer_urls)
+            ]
+            register_decode_ring(
+                req.first_block_id, pairs, expected_total,
+                transport=getattr(self, "_ring_transport", None),
+            )
+            self._ring_blocks[req.req_id] = req.first_block_id
+            if streaming:
+                # True-ring prefill: fetch per-layer KV in the background,
+                # bounded window ahead of the attention consumption
+                # watermark — never the whole prefix at once.
+                st = _PrefillStream(
+                    req.req_id, layer_order, pairs, expected_total
+                )
+                self._streams[req.req_id] = st
+                threading.Thread(
+                    target=self._stream_worker,
+                    args=(st, device),
+                    daemon=True,
+                ).start()
+                continue
+            # Legacy bulk staging (explicit HCP_RING_DECODE_RING=0 only).
             staged_total = 0
             for chunk_key, peer_url in zip(req.chunk_keys, req.peer_urls):
-                if chunk_key in self._chunk_refs:
+                if chunk_key in self._chunk_refs and self._chunk_refs[chunk_key] > 1:
                     # Already staged by another live request.
                     staged_total += self._chunk_lens.get(chunk_key, 0)
                     continue
-                # First live request referencing this chunk: stage all layers.
                 staged = 0
                 total_bytes = 0
-                for layer_name, layer in forward_context.no_compile_layers.items():
-                    kvc = getattr(layer, "kv_cache", None)
-                    device = (
-                        str(kvc.device)
-                        if torch.is_tensor(kvc) and kvc.numel() > 0
-                        else "cuda"
-                    )
+                for layer_name in layer_order:
                     tensors = self._load_layer(
                         chunk_key, layer_name, device, peer_url
                     )
@@ -693,55 +781,76 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                     total_bytes += k.numel() * k.element_size() * 2
                 self._chunk_lens[chunk_key] = k.shape[0]
                 staged_total += k.shape[0]
-                logger.info(
-                    "HcpRingKvConnector: staged peer chunk %s KV for %d layers "
-                    "(%d tokens/layer, %.1f MiB over %s) into TRANSIENT staging "
-                    "(paged pool untouched)",
-                    chunk_key,
-                    staged,
-                    k.shape[0],
-                    total_bytes / 2**20,
-                    peer_url or self._peer_url or "local store",
-                )
-                # Re-serve (neighbor accumulate-forward): mark the staged
-                # chunk ready in THIS node's store so its ring successor can
-                # pull the accumulated prefix from here alone.
-                with open(self._ready_marker(chunk_key), "w") as f:
-                    json.dump(
-                        {
-                            "tokens": k.shape[0],
-                            "layers": staged,
-                            "ts": time.time(),
-                            "re_served": True,
-                        },
-                        f,
-                    )
+                self._write_ready_marker(chunk_key, k.shape[0], staged)
             if staged_total != expected_total:
                 raise RuntimeError(
                     f"HcpRingKvConnector: staged prefix length {staged_total} "
                     f"!= expected external prefix {expected_total} "
                     f"(chunks={req.chunk_keys})"
                 )
-            # Bind this request to its ordered chunk set and track for cleanup.
-            map_request_peer(req.first_block_id, req.chunk_keys)
-            self._live[req.req_id] = (req.first_block_id, list(req.chunk_keys))
-            for chunk_key in req.chunk_keys:
-                self._chunk_refs[chunk_key] = (
-                    self._chunk_refs.get(chunk_key, 0) + 1
-                )
-            # Decode-ring: register the accumulator-ring endpoints for this
-            # request ((chunk, url) pairs in prefix order).  The backend
-            # switches the request to remote partial merges at decode start
-            # and releases the staged KV via the release callback.
-            pairs = [
-                (ck, (u or self._peer_url).rstrip("/"))
-                for ck, u in zip(req.chunk_keys, req.peer_urls)
-            ]
-            register_decode_ring(
-                req.first_block_id, pairs, expected_total,
-                transport=getattr(self, "_ring_transport", None),
+
+    def _write_ready_marker(
+        self, chunk_key: str, tokens: int, layers: int
+    ) -> None:
+        """Re-serve (neighbor accumulate-forward): mark the chunk ready in
+        THIS node's store so its ring successor can pull the accumulated
+        prefix from here alone."""
+        with open(self._ready_marker(chunk_key), "w") as f:
+            json.dump(
+                {
+                    "tokens": tokens,
+                    "layers": layers,
+                    "ts": time.time(),
+                    "re_served": True,
+                },
+                f,
             )
-            self._ring_blocks[req.req_id] = req.first_block_id
+
+    def _stream_worker(self, st: _PrefillStream, device: str) -> None:
+        """Background per-layer fetch pipeline for one request (streaming
+        prefill).  Stays at most _STREAM_WINDOW layers ahead of the
+        consumption watermark; sets a per-layer event as each layer's
+        staging becomes usable."""
+        lens: dict[str, int] = {}
+        staged_layers = 0
+        try:
+            for i, layer_name in enumerate(st.layers):
+                while (
+                    not st.done.is_set()
+                    and st.consumed_idx < i - _STREAM_WINDOW
+                ):
+                    time.sleep(0.001)
+                if st.done.is_set():
+                    return
+                for chunk_key, peer_url in st.chunk_urls:
+                    tensors = self._load_layer(
+                        chunk_key, layer_name, device, peer_url
+                    )
+                    if tensors is None:
+                        raise RuntimeError(
+                            "HcpRingKvConnector: peer KV fetch failed for "
+                            f"{chunk_key}/{layer_name} "
+                            f"(peer={peer_url or self._peer_url})"
+                        )
+                    k, v = tensors
+                    stage_peer_kv(chunk_key, layer_name, k, v)
+                    lens[chunk_key] = k.shape[0]
+                staged_layers += 1
+                st.events[layer_name].set()
+            staged_total = sum(lens.values())
+            for chunk_key, n in lens.items():
+                self._chunk_lens[chunk_key] = n
+                self._write_ready_marker(chunk_key, n, staged_layers)
+            if staged_total != st.expected_total:
+                raise RuntimeError(
+                    f"HcpRingKvConnector: staged prefix length {staged_total} "
+                    f"!= expected external prefix {st.expected_total} "
+                    f"(chunks={[c for c, _ in st.chunk_urls]})"
+                )
+        except Exception as e:  # noqa: BLE001
+            st.error = e
+            for ev in st.events.values():
+                ev.set()
 
     def _load_layer(
         self, chunk_key: str, layer_name: str, device: str, peer_url: str = ""
@@ -757,8 +866,33 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         return t["k"].contiguous(), t["v"].contiguous()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # Bulk staging happens in start_load_kv (before the forward pass).
-        return
+        # Streaming prefill: block until this layer's prefix KV is staged
+        # (the background pipeline runs up to _STREAM_WINDOW layers ahead),
+        # then advance the consumption watermark and release GPU staging of
+        # all earlier layers.  Transient staging stays bounded to
+        # ~(window+1) layers x num_chunks at all times.
+        if not self._streams:
+            return
+        idx = _layer_index(layer_name)
+        for st in list(self._streams.values()):
+            ev = st.events.get(layer_name)
+            if ev is not None:
+                ev.wait()
+            if st.error is not None:
+                raise RuntimeError(
+                    f"HcpRingKvConnector: prefill stream for req "
+                    f"{st.req_id} failed: {st.error}"
+                )
+            st.consumed_idx = max(st.consumed_idx, idx)
+        # GPU staging only; the disk store (re-serve / partial services)
+        # is untouched.
+        old = [
+            key
+            for key in PEER_KV_STAGING
+            if _layer_index(key[1]) < idx
+        ]
+        for key in old:
+            del PEER_KV_STAGING[key]
 
     def save_kv_layer(
         self,
@@ -823,6 +957,9 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         unbind its first-block -> chunks mapping.  Idempotent.  clear_ring
         also drops the decode-ring registration (only at request finish —
         decode steps need it for the whole decode phase)."""
+        st = self._streams.pop(req_id, None)
+        if st is not None:
+            st.done.set()
         live = self._live.pop(req_id, None)
         if live is not None:
             first_block_id, chunk_keys = live

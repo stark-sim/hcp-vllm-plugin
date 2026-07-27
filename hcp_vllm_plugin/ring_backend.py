@@ -157,7 +157,10 @@ _STAGING_RELEASE_FN = None
 
 
 def _decode_ring_enabled() -> bool:
-    return os.environ.get("HCP_RING_DECODE_RING", "0") == "1"
+    # Decode-ring is the DEFAULT (memory-split decode + streaming prefill).
+    # HCP_RING_DECODE_RING=0 explicitly selects the legacy owner-collapse
+    # comparison path (bulk staging, NOT memory-split).
+    return os.environ.get("HCP_RING_DECODE_RING", "1") == "1"
 
 
 def _growth_policy() -> str:

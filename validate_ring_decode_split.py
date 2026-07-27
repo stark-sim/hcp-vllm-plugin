@@ -321,6 +321,15 @@ def mode_consumer(args) -> None:
     expected_skips = (args.decode - 1) * NUM_LAYERS
     skip_count = rb.WRITE_TRACK.get("skipped", 0)
     skip_ok = skip_count == expected_skips
+    # Streaming prefill: transient GPU staging must be BOUNDED at all
+    # times — (window+1) layers × num prefix chunks, never the full
+    # prefix (the ISSUE-003 fix; default window=2, 2 chunks -> 6).
+    max_staged = rb.STAGING_STATS["max_staged_layers"]
+    stream_bound = 6
+    window_ok = max_staged <= stream_bound
+    print(f"[decode-split] peak staged layers: {max_staged} "
+          f"(streaming bound <= {stream_bound} = (window+1) x chunks): "
+          f"{'OK' if window_ok else 'VIOLATED'}")
     print(f"[decode-split] consumer wrote {n_written} pool slots "
           f"(expected <= {expected_slots} = c2 + flush + slack): "
           f"{'OK' if slots_ok else 'VIOLATED'}")
@@ -331,7 +340,7 @@ def mode_consumer(args) -> None:
           f"{ring_map_after == 0}")
 
     ok = (token_match and max_diff < 0.1 and decode_split_ok
-          and ring_clean_ok and slots_ok and skip_ok and impl_ok)
+          and ring_clean_ok and slots_ok and skip_ok and window_ok and impl_ok)
     print("--- result ---")
     print(f"  tokens match        : {token_match} (ref={ref_tokens} "
           f"cons={cons_tokens})")
@@ -340,6 +349,7 @@ def mode_consumer(args) -> None:
     print(f"  memsplit decode     : {'OK' if decode_split_ok else 'VIOLATED'}")
     print(f"  slots accounting    : {'OK' if slots_ok else 'VIOLATED'}")
     print(f"  pool-skip evidence  : {'OK' if skip_ok else 'VIOLATED'}")
+    print(f"  streaming window    : {'OK' if window_ok else 'VIOLATED'}")
     print(f"  triton kernel path  : {'OK' if impl_ok else 'NOT USED'}")
     print(f"  verdict: {'PASS' if ok else 'FAIL'}", flush=True)
     sys.exit(0 if ok else 1)
