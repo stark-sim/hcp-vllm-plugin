@@ -456,11 +456,14 @@ class HcpRingKvConnector(KVConnectorBase_V1):
             self._run_dir(), partial_chunks, my_index
         )
 
-        # Non-owner nodes start the relay worker thread immediately.
+        # Non-owner nodes start the relay worker thread immediately; the
+        # thread itself waits for the chunk store to become ready (the
+        # store appears only after this node's prefill, which cannot
+        # happen until engine init completes — waiting HERE would
+        # self-deadlock the engine construction).
         # Owner does NOT run relay — it initiates packets synchronously
         # from within the vLLM forward pass.
         if my_index != 0:
-            self._ring_node.wait_ready(timeout_s=600)
             self._ring_node.start_relay(self._ring_transport)
 
         logger.info(

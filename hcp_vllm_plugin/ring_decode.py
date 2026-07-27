@@ -504,7 +504,17 @@ class RingDecodeNode:
         self._running = False
 
     def _relay_loop(self) -> None:
-        """Continuously receive packets, process, and forward."""
+        """Wait for the chunk snapshot, then continuously receive packets,
+        process, and forward.  The store readiness wait happens in THIS
+        thread (never in connector init): the store files appear only after
+        this node's own prefill, long after engine construction; packets
+        arrive even later (owner decode), so blocking here is safe."""
+        if not self.wait_ready(timeout_s=3600):
+            logger.warning(
+                "RingDecodeNode[%d]: chunk store never became ready; relay "
+                "exiting", self._ring_index,
+            )
+            return
         transport = self._transport
         while self._running:
             try:
