@@ -368,8 +368,9 @@ def _wait_ready(path: str, proc: subprocess.Popen, name: str, timeout: int = 600
 
 
 def mode_all(args) -> None:
-    if os.environ.get("HCP_RING_DECODE_RING", "0") != "1":
-        print("HCP_RING_DECODE_RING=1 is required; set it and rerun", flush=True)
+    if os.environ.get("HCP_RING_DECODE_RING", "1") != "1":
+        print("HCP_RING_DECODE_RING=0 (legacy) is not supported by this test",
+              flush=True)
         sys.exit(2)
     if os.environ.get("HCP_RING_DECODE_TRANSPORT", "ring") != "ring":
         print("HCP_RING_DECODE_TRANSPORT=ring is required for this test",
