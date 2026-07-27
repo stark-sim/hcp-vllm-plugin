@@ -61,7 +61,7 @@ class RingTransport:
         self,
         ring_addrs: list[tuple[str, int]],
         my_index: int,
-        connect_timeout_s: float = 120,
+        connect_timeout_s: float = 600,
     ) -> None:
         self._ring_addrs = list(ring_addrs)
         self._n = len(ring_addrs)
@@ -78,8 +78,11 @@ class RingTransport:
         self._running = False
         self._listener_thread: threading.Thread | None = None
         self._recv_thread: threading.Thread | None = None
+        self._connect_thread: threading.Thread | None = None
         self._send_lock = threading.Lock()
         self._started = threading.Event()
+        self._connected = threading.Event()
+        self._connect_error: Exception | None = None
 
         # Stats
         self.packets_sent = 0
@@ -128,8 +131,14 @@ class RingTransport:
         )
         self._listener_thread.start()
 
-        # 3. Connect to successor (with retries — successor may not be up yet)
-        self._connect_successor()
+        # 3. Connect to successor in the BACKGROUND — ring nodes come up
+        #    sequentially (a node's successor may start minutes later), so
+        #    blocking here would deadlock the startup chain.  send_packet
+        #    waits on _connected instead.
+        self._connect_thread = threading.Thread(
+            target=self._connect_successor_bg, daemon=True
+        )
+        self._connect_thread.start()
 
         # 4. Start recv pump thread
         self._recv_thread = threading.Thread(target=self._recv_pump, daemon=True)
@@ -165,8 +174,14 @@ class RingTransport:
         with self._send_lock:
             sock = self._send_sock
             if sock is None:
+                # Successor may legitimately start later (sequential ring
+                # bring-up): wait for the background connect to finish.
+                self._connected.wait(timeout=self._connect_timeout + 30)
+                sock = self._send_sock
+            if sock is None:
                 raise RuntimeError(
-                    f"RingTransport[{self._my_index}]: no successor connection"
+                    f"RingTransport[{self._my_index}]: no successor "
+                    f"connection ({self._connect_error})"
                 )
             sock.sendall(header + payload)
         self.packets_sent += 1
@@ -202,6 +217,20 @@ class RingTransport:
                 if self._running:
                     time.sleep(0.1)
                 return
+
+    def _connect_successor_bg(self) -> None:
+        """Background wrapper: record the outcome and unblock senders either
+        way (success sets _send_sock, failure sets _connect_error)."""
+        try:
+            self._connect_successor()
+        except Exception as e:  # noqa: BLE001
+            self._connect_error = e
+            logger.warning(
+                "RingTransport[%d]: successor connect failed: %s",
+                self._my_index, e,
+            )
+        finally:
+            self._connected.set()
 
     def _connect_successor(self) -> None:
         """Connect to ring successor with retries."""
