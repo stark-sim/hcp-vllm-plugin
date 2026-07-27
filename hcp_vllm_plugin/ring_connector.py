@@ -330,6 +330,12 @@ class HcpRingKvConnector(KVConnectorBase_V1):
         self._ring_blocks: dict[str, int] = {}
         # req_id -> streaming prefill pipeline state (decode-ring mode only).
         self._streams: dict[str, "_PrefillStream"] = {}
+        # Serializes per-(chunk, layer) fetch+stage across concurrent
+        # request streams: two requests sharing a chunk would otherwise
+        # download the same store file simultaneously and read it back
+        # half-written ("header too small").  The staged-check inside the
+        # lock also dedups the second request's fetch entirely.
+        self._stage_lock = threading.Lock()
         os.makedirs(self._run_dir(), exist_ok=True)
         # Producer-side WORKER connectors hold/serve KV; the scheduler-side
         # instance must not bind the HTTP port.
@@ -802,18 +808,26 @@ class HcpRingKvConnector(KVConnectorBase_V1):
                 if st.done.is_set():
                     return
                 for chunk_key, peer_url in st.chunk_urls:
-                    tensors = self._load_layer(
-                        chunk_key, layer_name, device, peer_url
-                    )
-                    if tensors is None:
-                        raise RuntimeError(
-                            "HcpRingKvConnector: peer KV fetch failed for "
-                            f"{chunk_key}/{layer_name} "
-                            f"(peer={peer_url or self._peer_url})"
+                    with self._stage_lock:
+                        if (chunk_key, layer_name) in PEER_KV_STAGING:
+                            # A concurrent request's stream already staged
+                            # this (chunk, layer) — reuse, never re-download.
+                            lens[chunk_key] = PEER_KV_STAGING[
+                                (chunk_key, layer_name)
+                            ][0].shape[0]
+                            continue
+                        tensors = self._load_layer(
+                            chunk_key, layer_name, device, peer_url
                         )
-                    k, v = tensors
-                    stage_peer_kv(chunk_key, layer_name, k, v)
-                    lens[chunk_key] = k.shape[0]
+                        if tensors is None:
+                            raise RuntimeError(
+                                "HcpRingKvConnector: peer KV fetch failed for "
+                                f"{chunk_key}/{layer_name} "
+                                f"(peer={peer_url or self._peer_url})"
+                            )
+                        k, v = tensors
+                        stage_peer_kv(chunk_key, layer_name, k, v)
+                        lens[chunk_key] = k.shape[0]
                 staged_layers += 1
                 st.events[layer_name].set()
             staged_total = sum(lens.values())
