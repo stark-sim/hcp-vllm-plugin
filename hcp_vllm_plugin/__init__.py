@@ -14,6 +14,9 @@ ROCm) cooperate on long sequences via memory-splitting context parallelism:
     plugin's Triton kernel (ring_triton_attn, LSE output, CUDA and ROCm).
   * ``HcpCpConnector``: earlier full-KV context-passing connector, kept for
     comparison/reference.
+  * ``HcpFileConnector`` (``file_connector.py``, vLLM 0.31): cross-engine PD
+    route — loads HCP-exported prefill KV (``hcp-kv-v1`` file format) into the
+    paged cache so vLLM decodes directly without re-prefill.
 
 Registered as a ``vllm.general_plugins`` entry point; the connectors can also
 be loaded directly via ``kv_connector_module_path``.
